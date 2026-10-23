@@ -1,0 +1,880 @@
+package httpserver
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+
+	"icloud-api/internal/apple"
+	"icloud-api/internal/domain"
+	"icloud-api/internal/hmesync"
+	"icloud-api/internal/store"
+)
+
+type fakeHMESyncService struct {
+	startAuth     func(context.Context, int64, int64, string, string, apple.Region) (hmesync.AuthResult, error)
+	verifyAuth    func(context.Context, int64, int64, string, string) (hmesync.AuthResult, error)
+	getSession    func(context.Context, int64) (hmesync.SessionInfo, error)
+	clearAuth     func(context.Context, int64) error
+	syncAliases   func(context.Context, int64) (hmesync.SyncResult, error)
+	deleteAlias   func(context.Context, int64) error
+	deleteAliases func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error)
+}
+
+func (f *fakeHMESyncService) StartAuth(
+	ctx context.Context,
+	ownerAdminID, accountID int64,
+	appleID, password string,
+	region apple.Region,
+) (hmesync.AuthResult, error) {
+	if f.startAuth == nil {
+		return hmesync.AuthResult{}, errors.New("unexpected StartAuth call")
+	}
+	return f.startAuth(ctx, ownerAdminID, accountID, appleID, password, region)
+}
+
+func (f *fakeHMESyncService) VerifyAuth(
+	ctx context.Context,
+	ownerAdminID, accountID int64,
+	challengeID, code string,
+) (hmesync.AuthResult, error) {
+	if f.verifyAuth == nil {
+		return hmesync.AuthResult{}, errors.New("unexpected VerifyAuth call")
+	}
+	return f.verifyAuth(ctx, ownerAdminID, accountID, challengeID, code)
+}
+
+func (f *fakeHMESyncService) GetSession(ctx context.Context, accountID int64) (hmesync.SessionInfo, error) {
+	if f.getSession == nil {
+		return hmesync.SessionInfo{Status: hmesync.StatusLoginRequired}, nil
+	}
+	return f.getSession(ctx, accountID)
+}
+
+func (f *fakeHMESyncService) ClearAuth(ctx context.Context, accountID int64) error {
+	if f.clearAuth == nil {
+		return errors.New("unexpected ClearAuth call")
+	}
+	return f.clearAuth(ctx, accountID)
+}
+
+func (f *fakeHMESyncService) SyncAliases(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
+	if f.syncAliases == nil {
+		return hmesync.SyncResult{}, errors.New("unexpected SyncAliases call")
+	}
+	return f.syncAliases(ctx, accountID)
+}
+
+func (f *fakeHMESyncService) DeleteAlias(ctx context.Context, aliasID int64) error {
+	if f.deleteAlias == nil {
+		return errors.New("unexpected DeleteAlias call")
+	}
+	return f.deleteAlias(ctx, aliasID)
+}
+
+func (f *fakeHMESyncService) DeleteAliases(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+	if f.deleteAliases == nil {
+		return nil, errors.New("unexpected DeleteAliases call")
+	}
+	return f.deleteAliases(ctx, aliasIDs)
+}
+
+func TestAdminAPIAppleAuthAndAliasSyncFlow(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	var logs strings.Builder
+	env.server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	sessionCookie, csrf, admin := env.createSession(t, "apple-flow-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "owner@icloud.com")
+
+	const (
+		appleID     = "owner@icloud.com"
+		appleSecret = "ordinary-apple-password-secret"
+		challengeID = "challenge-secret-0123456789"
+		code        = "246810"
+	)
+	authenticatedAt := time.Date(2026, time.August, 7, 12, 30, 0, 0, time.UTC)
+	currentSession := hmesync.SessionInfo{Status: hmesync.StatusLoginRequired}
+	var startCalled, verifyCalled, clearCalled, syncCalled bool
+	fake := &fakeHMESyncService{}
+	fake.startAuth = func(_ context.Context, ownerAdminID, accountID int64, gotAppleID, password string, region apple.Region) (hmesync.AuthResult, error) {
+		startCalled = true
+		if ownerAdminID != admin.ID || accountID != account.ID || gotAppleID != appleID || password != appleSecret || region != apple.RegionChina {
+			t.Fatalf("StartAuth args = admin:%d account:%d appleID:%q password:%q region:%q", ownerAdminID, accountID, gotAppleID, password, region)
+		}
+		currentSession = hmesync.SessionInfo{Status: hmesync.StatusVerificationRequired, AppleID: appleID, Region: hmesync.RegionChina}
+		return hmesync.AuthResult{Status: hmesync.StatusVerificationRequired, ChallengeID: challengeID, Session: currentSession}, nil
+	}
+	fake.verifyAuth = func(_ context.Context, ownerAdminID, accountID int64, gotChallengeID, gotCode string) (hmesync.AuthResult, error) {
+		verifyCalled = true
+		if ownerAdminID != admin.ID || accountID != account.ID || gotChallengeID != challengeID || gotCode != code {
+			t.Fatalf("VerifyAuth args = admin:%d account:%d challenge:%q code:%q", ownerAdminID, accountID, gotChallengeID, gotCode)
+		}
+		currentSession = hmesync.SessionInfo{
+			Status:          hmesync.StatusAuthenticated,
+			AppleID:         appleID,
+			Region:          hmesync.RegionChina,
+			AuthenticatedAt: &authenticatedAt,
+		}
+		return hmesync.AuthResult{Status: hmesync.StatusAuthenticated, Session: currentSession}, nil
+	}
+	fake.getSession = func(_ context.Context, accountID int64) (hmesync.SessionInfo, error) {
+		if accountID != account.ID {
+			t.Fatalf("GetSession account = %d, want %d", accountID, account.ID)
+		}
+		return currentSession, nil
+	}
+	fake.syncAliases = func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
+		syncCalled = true
+		if accountID != account.ID {
+			t.Fatalf("SyncAliases account = %d, want %d", accountID, account.ID)
+		}
+		alias, err := env.store.CreateAlias(ctx, domain.Alias{
+			AccountID: accountID,
+			Address:   "generated@privaterelay.appleid.com",
+			Label:     "Apple 导入",
+			Enabled:   true,
+		})
+		if err != nil {
+			return hmesync.SyncResult{}, err
+		}
+		return hmesync.SyncResult{
+			Summary: hmesync.SyncSummary{Total: 3, CreatedCount: 1, ExistingCount: 2, InactiveCount: 1, ImportedDisabledCount: 1},
+			Created: []hmesync.CreatedAlias{{Alias: alias}},
+			Session: currentSession,
+		}, nil
+	}
+	fake.clearAuth = func(_ context.Context, accountID int64) error {
+		clearCalled = true
+		if accountID != account.ID {
+			t.Fatalf("ClearAuth account = %d, want %d", accountID, account.ID)
+		}
+		currentSession = hmesync.SessionInfo{Status: hmesync.StatusLoginRequired}
+		return nil
+	}
+	env.server.SetHMESyncService(fake)
+
+	basePath := fmt.Sprintf("/admin/api/v1/accounts/%d", account.ID)
+	loginResponse := env.request(t, http.MethodPost, basePath+"/apple-auth", adminAPITestJSON(t, map[string]any{
+		"apple_id": appleID,
+		"password": appleSecret,
+		"region":   "cn",
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if loginResponse.Code != http.StatusAccepted || !strings.Contains(loginResponse.Header().Get("Cache-Control"), "no-store") {
+		t.Fatalf("Apple login status/cache = %d %q; body=%s", loginResponse.Code, loginResponse.Header().Get("Cache-Control"), loginResponse.Body.String())
+	}
+	var loginPayload struct {
+		Data struct {
+			Status      string `json:"status"`
+			ChallengeID string `json:"challenge_id"`
+			Session     struct {
+				Status  string `json:"status"`
+				AppleID string `json:"apple_id"`
+				Region  string `json:"region"`
+			} `json:"apple_session"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(loginResponse.Body.Bytes(), &loginPayload); err != nil {
+		t.Fatalf("decode Apple login response: %v; body=%s", err, loginResponse.Body.String())
+	}
+	if loginPayload.Data.Status != hmesync.StatusVerificationRequired || loginPayload.Data.ChallengeID != challengeID || loginPayload.Data.Session.Status != hmesync.StatusVerificationRequired || loginPayload.Data.Session.AppleID != appleID || loginPayload.Data.Session.Region != hmesync.RegionChina {
+		t.Fatalf("Apple login response = %#v", loginPayload.Data)
+	}
+	if strings.Contains(loginResponse.Body.String(), appleSecret) {
+		t.Fatalf("Apple login response exposed password: %s", loginResponse.Body.String())
+	}
+
+	verifyResponse := env.request(t, http.MethodPost, basePath+"/apple-auth/verify", adminAPITestJSON(t, map[string]string{
+		"challenge_id": challengeID,
+		"code":         code,
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if verifyResponse.Code != http.StatusOK || !strings.Contains(verifyResponse.Body.String(), `"status":"authenticated"`) {
+		t.Fatalf("Apple verify response = %d; body=%s", verifyResponse.Code, verifyResponse.Body.String())
+	}
+	if strings.Contains(verifyResponse.Body.String(), code) || strings.Contains(verifyResponse.Body.String(), challengeID) {
+		t.Fatalf("Apple verify response exposed submitted verification data: %s", verifyResponse.Body.String())
+	}
+
+	detailResponse := env.request(t, http.MethodGet, basePath, nil, "", []*http.Cookie{sessionCookie}, "")
+	if detailResponse.Code != http.StatusOK || !strings.Contains(detailResponse.Body.String(), `"apple_session":{"status":"authenticated"`) {
+		t.Fatalf("account detail Apple session = %d; body=%s", detailResponse.Code, detailResponse.Body.String())
+	}
+
+	syncResponse := env.request(t, http.MethodPost, basePath+"/aliases/sync", nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if syncResponse.Code != http.StatusOK {
+		t.Fatalf("Apple alias sync = %d; body=%s", syncResponse.Code, syncResponse.Body.String())
+	}
+	var syncPayload struct {
+		Data struct {
+			Account struct {
+				AliasCount int `json:"alias_count"`
+			} `json:"account"`
+			Aliases []adminAPIAliasDTO `json:"aliases"`
+			Summary struct {
+				Total                 int `json:"total"`
+				CreatedCount          int `json:"created_count"`
+				ExistingCount         int `json:"existing_count"`
+				InactiveCount         int `json:"inactive_count"`
+				ImportedDisabledCount int `json:"imported_disabled_count"`
+			} `json:"summary"`
+			Created []adminAPIAppleCreatedAliasDTO `json:"created"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(syncResponse.Body.Bytes(), &syncPayload); err != nil {
+		t.Fatalf("decode Apple sync response: %v; body=%s", err, syncResponse.Body.String())
+	}
+	if syncPayload.Data.Summary.Total != 3 || syncPayload.Data.Summary.CreatedCount != 1 || syncPayload.Data.Summary.ExistingCount != 2 || syncPayload.Data.Summary.InactiveCount != 1 || syncPayload.Data.Summary.ImportedDisabledCount != 1 || syncPayload.Data.Account.AliasCount != 1 || len(syncPayload.Data.Aliases) != 1 || len(syncPayload.Data.Created) != 1 {
+		t.Fatalf("Apple sync payload = %#v", syncPayload.Data)
+	}
+	created := syncPayload.Data.Created[0]
+	if created.Alias.Address != "generated@privaterelay.appleid.com" || created.Alias.APIKey == "" ||
+		created.APIKey != created.Alias.APIKey || created.MailAPIDirectLink != created.Alias.DirectLinkPath ||
+		!strings.HasPrefix(created.MailAPIDirectLink, "/api/v1/mail/recent?api_key=") ||
+		created.Alias.IMAPPassword == "" || created.Alias.ClientID == "" || created.Alias.RefreshToken == "" ||
+		!strings.Contains(created.Alias.OTPURLPath, "/api/v1/otp?token=") ||
+		strings.Contains(created.Alias.OTPURLPath, created.Alias.APIKey) {
+		t.Fatalf("created credential = %#v", created)
+	}
+
+	clearResponse := env.request(t, http.MethodDelete, basePath+"/apple-auth", nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if clearResponse.Code != http.StatusNoContent || clearResponse.Body.Len() != 0 {
+		t.Fatalf("clear Apple auth = %d; body=%s", clearResponse.Code, clearResponse.Body.String())
+	}
+	if !startCalled || !verifyCalled || !syncCalled || !clearCalled {
+		t.Fatalf("service calls start=%t verify=%t sync=%t clear=%t", startCalled, verifyCalled, syncCalled, clearCalled)
+	}
+
+	audits, err := env.store.ListAuditLogs(context.Background(), 50, 0)
+	if err != nil {
+		t.Fatalf("list Apple audit logs: %v", err)
+	}
+	auditText := fmt.Sprintf("%+v", audits)
+	for _, secret := range []string{appleSecret, challengeID, code, created.Alias.APIKey, sessionCookie.Value} {
+		if strings.Contains(auditText, secret) {
+			t.Fatalf("audit log exposed secret %q: %s", secret, auditText)
+		}
+		if strings.Contains(logs.String(), secret) {
+			t.Fatalf("application log exposed secret %q: %s", secret, logs.String())
+		}
+	}
+	for _, action := range []string{"apple_auth_start", "apple_auth_verify", "sync_hme_aliases", "apple_session_clear"} {
+		if !strings.Contains(auditText, action) {
+			t.Fatalf("audit log omitted action %q: %s", action, auditText)
+		}
+	}
+}
+
+func TestAdminAPIDeleteAliasUsesAppleServiceAndAuditsSuccess(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "delete-success@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "delete-success-alias@icloud.com")
+
+	deleteCalls := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAlias: func(ctx context.Context, aliasID int64) error {
+			deleteCalls++
+			if aliasID != alias.ID {
+				t.Fatalf("delete alias ID = %d, want %d", aliasID, alias.ID)
+			}
+			return env.store.DeleteAlias(ctx, aliasID)
+		},
+	})
+
+	path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+	response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusNoContent || response.Body.Len() != 0 {
+		t.Fatalf("delete alias response = %d; body=%s", response.Code, response.Body.String())
+	}
+	if deleteCalls != 1 {
+		t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("deleted alias lookup error = %v, want not found", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, alias.ID, "success", "")
+}
+
+func TestAdminAPIBatchDeleteAliasesUsesAppleServiceAndAuditsEachSuccess(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-delete-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-success@icloud.com")
+	first := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-first@icloud.com")
+	second := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-second@icloud.com")
+
+	deleteCalls := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAliases: func(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalls++
+			if !reflect.DeepEqual(aliasIDs, []int64{first.ID, second.ID}) {
+				t.Fatalf("batch delete IDs = %#v", aliasIDs)
+			}
+			for _, aliasID := range aliasIDs {
+				if err := env.store.DeleteAlias(ctx, aliasID); err != nil {
+					return nil, err
+				}
+			}
+			return []hmesync.AliasDeletionOutcome{
+				{AliasID: first.ID},
+				{AliasID: second.ID},
+			}, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{first.ID, second.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK || deleteCalls != 1 {
+		t.Fatalf("batch delete response = %d; calls=%d; body=%s", response.Code, deleteCalls, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAliasBatchDeleteDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode batch delete response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Requested != 2 || payload.Data.Deleted != 2 || payload.Data.Failed != 0 ||
+		len(payload.Data.Results) != 2 || !payload.Data.Results[0].Deleted || !payload.Data.Results[1].Deleted {
+		t.Fatalf("batch delete payload = %#v", payload.Data)
+	}
+	for _, alias := range []domain.Alias{first, second} {
+		if _, err := env.store.GetAlias(context.Background(), alias.ID); !errors.Is(err, store.ErrNotFound) {
+			t.Fatalf("batch deleted alias %d lookup error = %v", alias.ID, err)
+		}
+		assertAdminAliasDeleteAudit(t, env.store, alias.ID, "success", "batch")
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesReturnsPartialAppleFailures(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-partial-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-partial@icloud.com")
+	deleted := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-removed@icloud.com")
+	failed := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-retained@icloud.com")
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			return hmesync.SessionInfo{Status: hmesync.StatusAuthenticated}, nil
+		},
+		deleteAliases: func(ctx context.Context, aliasIDs []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			if err := env.store.DeleteAlias(ctx, deleted.ID); err != nil {
+				return nil, err
+			}
+			return []hmesync.AliasDeletionOutcome{
+				{AliasID: deleted.ID},
+				{AliasID: failed.ID, Err: hmesync.ErrRateLimited},
+			}, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{deleted.ID, failed.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK {
+		t.Fatalf("partial batch delete response = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data adminAPIAliasBatchDeleteDTO `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode partial batch delete response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Deleted != 1 || payload.Data.Failed != 1 || len(payload.Data.Results) != 2 ||
+		payload.Data.Results[1].Deleted || payload.Data.Results[1].Code != hmesync.CodeRateLimited ||
+		!payload.Data.Results[1].LocalRetained || !strings.Contains(payload.Data.Results[1].Message, "本地记录已保留") {
+		t.Fatalf("partial batch delete payload = %#v", payload.Data)
+	}
+	if _, err := env.store.GetAlias(context.Background(), deleted.ID); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("successfully deleted alias remains: %v", err)
+	}
+	if _, err := env.store.GetAlias(context.Background(), failed.ID); err != nil {
+		t.Fatalf("failed alias was removed: %v", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, failed.ID, "failed", hmesync.CodeRateLimited)
+}
+
+func TestAdminAPIBatchDeleteAliasesRequiresHealthyAppleSession(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-login-required-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-login-required@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-login-required-alias@icloud.com")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != hmesync.CodeLoginRequired || deleteCalled {
+		t.Fatalf("batch delete without Apple login = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("preflight failure removed local alias: %v", err)
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesRejectsCustomMailbox(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-custom-admin", "unused-password")
+	encrypted, err := env.cipher.Encrypt("app-specific-password")
+	if err != nil {
+		t.Fatalf("encrypt custom account password: %v", err)
+	}
+	account, err := env.store.CreateAccount(context.Background(), domain.Account{
+		Name:               "Custom batch delete",
+		Email:              "custom-batch@identity.invalid",
+		MailboxType:        domain.MailboxTypeCustom,
+		EmailSuffix:        "example.test",
+		IMAPHost:           "imap.example.test",
+		IMAPPort:           993,
+		IMAPUsername:       "custom-batch@example.test",
+		PasswordCiphertext: encrypted,
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("create custom batch account: %v", err)
+	}
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "custom-alias@example.test")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			t.Fatal("custom mailbox reached Apple session preflight")
+			return hmesync.SessionInfo{}, nil
+		},
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "CUSTOM_MAILBOX_NO_APPLE" || deleteCalled {
+		t.Fatalf("custom batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("custom preflight removed local alias: %v", err)
+	}
+}
+
+func TestAdminAPIBatchDeleteAliasesRejectsSyncError(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-batch-sync-error-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "batch-delete-sync-error@icloud.com")
+	if err := env.store.UpdateAccountSyncStatus(context.Background(), account.ID, domain.SyncStatusError, "sync failed", nil); err != nil {
+		t.Fatalf("set sync error: %v", err)
+	}
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "batch-delete-sync-error-alias@icloud.com")
+	deleteCalled := false
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		getSession: func(context.Context, int64) (hmesync.SessionInfo, error) {
+			t.Fatal("sync-error account reached Apple session preflight")
+			return hmesync.SessionInfo{}, nil
+		},
+		deleteAliases: func(context.Context, []int64) ([]hmesync.AliasDeletionOutcome, error) {
+			deleteCalled = true
+			return nil, nil
+		},
+	})
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/batch", adminAPITestJSON(t, map[string]any{
+		"alias_ids": []int64{alias.ID},
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusConflict || adminAPITestErrorCode(t, response) != "BATCH_DELETE_NOT_ELIGIBLE" || deleteCalled {
+		t.Fatalf("sync-error batch delete = %d; called=%t; body=%s", response.Code, deleteCalled, response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("sync-error preflight removed local alias: %v", err)
+	}
+}
+
+func TestAdminAPIDeleteAliasAppleFailuresKeepLocalRecord(t *testing.T) {
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{
+			name:       "login required wrapping missing session",
+			err:        fmt.Errorf("load Apple session: %w: %w", hmesync.ErrLoginRequired, store.ErrNotFound),
+			wantStatus: http.StatusConflict,
+			wantCode:   hmesync.CodeLoginRequired,
+		},
+		{name: "session expired", err: hmesync.ErrSessionExpired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeSessionExpired},
+		{name: "rate limited", err: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
+		{name: "upstream", err: hmesync.ErrUpstream, wantStatus: http.StatusBadGateway, wantCode: hmesync.CodeUpstreamError},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			env := newAdminAPITestEnv(t)
+			sessionCookie, csrf, _ := env.createSession(t, "apple-delete-failure-"+strings.ReplaceAll(test.name, " ", "-"), "unused-password")
+			account := adminAPITestCreateAccount(t, env, strings.ReplaceAll(test.name, " ", "-")+"@icloud.com")
+			alias := adminAPITestCreateDeleteAlias(t, env, account.ID, strings.ReplaceAll(test.name, " ", "-")+"-alias@icloud.com")
+			deleteCalls := 0
+			env.server.SetHMESyncService(&fakeHMESyncService{
+				deleteAlias: func(_ context.Context, aliasID int64) error {
+					deleteCalls++
+					if aliasID != alias.ID {
+						t.Fatalf("delete alias ID = %d, want %d", aliasID, alias.ID)
+					}
+					return test.err
+				},
+			})
+
+			path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+			response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+			if response.Code != test.wantStatus || adminAPITestErrorCode(t, response) != test.wantCode {
+				t.Fatalf("delete alias response = %d; body=%s; want %d %s", response.Code, response.Body.String(), test.wantStatus, test.wantCode)
+			}
+			if !strings.Contains(response.Body.String(), "本地记录已保留") {
+				t.Fatalf("delete failure omitted local-retention notice: %s", response.Body.String())
+			}
+			if deleteCalls != 1 {
+				t.Fatalf("Apple delete calls = %d, want 1", deleteCalls)
+			}
+			if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+				t.Fatalf("failed Apple delete removed local alias: %v", err)
+			}
+			assertAdminAliasDeleteAudit(t, env.store, alias.ID, "failed", test.wantCode)
+		})
+	}
+}
+
+func TestAdminAPIDeleteAliasWithoutAppleServiceKeepsLocalRecord(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-unavailable", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "delete-unavailable@icloud.com")
+	alias := adminAPITestCreateDeleteAlias(t, env, account.ID, "delete-unavailable-alias@icloud.com")
+
+	path := fmt.Sprintf("/admin/api/v1/aliases/%d", alias.ID)
+	response := env.request(t, http.MethodDelete, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusServiceUnavailable || adminAPITestErrorCode(t, response) != "INTERNAL_ERROR" {
+		t.Fatalf("delete alias without Apple service = %d; body=%s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), "本地记录已保留") {
+		t.Fatalf("unavailable delete service omitted local-retention notice: %s", response.Body.String())
+	}
+	if _, err := env.store.GetAlias(context.Background(), alias.ID); err != nil {
+		t.Fatalf("missing Apple service removed local alias: %v", err)
+	}
+	assertAdminAliasDeleteAudit(t, env.store, alias.ID, "failed", "INTERNAL_ERROR")
+}
+
+func TestAdminAPIDeleteMissingAliasReturnsNotFoundBeforeAppleService(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-delete-missing", "unused-password")
+
+	response := env.request(t, http.MethodDelete, "/admin/api/v1/aliases/999999", nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusNotFound || adminAPITestErrorCode(t, response) != "NOT_FOUND" {
+		t.Fatalf("delete missing alias = %d; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func TestAdminAPIAppleEndpointsRequireAdminCSRFAndStrictJSON(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-security-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "security@icloud.com")
+	callCount := 0
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		startAuth: func(context.Context, int64, int64, string, string, apple.Region) (hmesync.AuthResult, error) {
+			callCount++
+			return hmesync.AuthResult{}, nil
+		},
+		verifyAuth: func(context.Context, int64, int64, string, string) (hmesync.AuthResult, error) {
+			callCount++
+			return hmesync.AuthResult{}, nil
+		},
+	})
+	path := fmt.Sprintf("/admin/api/v1/accounts/%d/apple-auth", account.ID)
+	body := adminAPITestJSON(t, map[string]string{"apple_id": "security@icloud.com", "password": "secret", "region": "global"})
+
+	unauthenticated := env.request(t, http.MethodPost, path, body, "application/json", nil, "")
+	if unauthenticated.Code != http.StatusUnauthorized || adminAPITestErrorCode(t, unauthenticated) != "AUTH_REQUIRED" {
+		t.Fatalf("unauthenticated Apple auth = %d; body=%s", unauthenticated.Code, unauthenticated.Body.String())
+	}
+	missingCSRF := env.request(t, http.MethodPost, path, body, "application/json", []*http.Cookie{sessionCookie}, "")
+	if missingCSRF.Code != http.StatusForbidden || adminAPITestErrorCode(t, missingCSRF) != "CSRF_INVALID" {
+		t.Fatalf("Apple auth without CSRF = %d; body=%s", missingCSRF.Code, missingCSRF.Body.String())
+	}
+	unknownField := env.request(t, http.MethodPost, path, adminAPITestJSON(t, map[string]string{
+		"apple_id": "security@icloud.com", "password": "secret", "region": "global", "cookie": "must-not-be-accepted",
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if unknownField.Code != http.StatusBadRequest || adminAPITestErrorCode(t, unknownField) != "INVALID_JSON" {
+		t.Fatalf("Apple auth unknown field = %d; body=%s", unknownField.Code, unknownField.Body.String())
+	}
+	invalidRegion := env.request(t, http.MethodPost, path, adminAPITestJSON(t, map[string]string{
+		"apple_id": "security@icloud.com", "password": "secret", "region": "other",
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if invalidRegion.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalidRegion) != "VALIDATION_FAILED" {
+		t.Fatalf("Apple auth invalid region = %d; body=%s", invalidRegion.Code, invalidRegion.Body.String())
+	}
+	invalidVerification := env.request(t, http.MethodPost, path+"/verify", adminAPITestJSON(t, map[string]string{
+		"challenge_id": "challenge", "code": "12A456",
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if invalidVerification.Code != http.StatusBadRequest || adminAPITestErrorCode(t, invalidVerification) != "VALIDATION_FAILED" {
+		t.Fatalf("Apple verify invalid code = %d; body=%s", invalidVerification.Code, invalidVerification.Body.String())
+	}
+	if callCount != 0 {
+		t.Fatalf("Apple service called %d times for rejected requests", callCount)
+	}
+}
+
+func TestAdminAPIAppleErrorsUseDedicatedCodesAndRedactedLogs(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	var logs strings.Builder
+	env.server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	sessionCookie, csrf, _ := env.createSession(t, "apple-error-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "errors@icloud.com")
+	var serviceErr error
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		startAuth: func(context.Context, int64, int64, string, string, apple.Region) (hmesync.AuthResult, error) {
+			return hmesync.AuthResult{}, serviceErr
+		},
+	})
+
+	tests := []struct {
+		name       string
+		err        error
+		wantStatus int
+		wantCode   string
+	}{
+		{name: "login required", err: hmesync.ErrLoginRequired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeLoginRequired},
+		{name: "login required wrapping missing row", err: fmt.Errorf("login: %w; row: %w", hmesync.ErrLoginRequired, store.ErrNotFound), wantStatus: http.StatusConflict, wantCode: hmesync.CodeLoginRequired},
+		{name: "session expired", err: hmesync.ErrSessionExpired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeSessionExpired},
+		{name: "credentials", err: hmesync.ErrCredentialsInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: hmesync.CodeCredentialsInvalid},
+		{name: "verification", err: hmesync.ErrVerificationInvalid, wantStatus: http.StatusUnprocessableEntity, wantCode: hmesync.CodeVerificationInvalid},
+		{name: "flow expired", err: hmesync.ErrFlowExpired, wantStatus: http.StatusGone, wantCode: hmesync.CodeFlowExpired},
+		{name: "account action required", err: hmesync.ErrAccountActionRequired, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountActionRequired},
+		{name: "rate limited", err: hmesync.ErrRateLimited, wantStatus: http.StatusTooManyRequests, wantCode: hmesync.CodeRateLimited},
+		{name: "account mismatch", err: hmesync.ErrAccountMismatch, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountMismatch},
+		{name: "account changed", err: hmesync.ErrAccountChanged, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAccountChanged},
+		{name: "alias conflict", err: store.ErrAliasOwnershipConflict, wantStatus: http.StatusConflict, wantCode: hmesync.CodeAliasOwnershipConflict},
+		{name: "deadline", err: context.DeadlineExceeded, wantStatus: http.StatusGatewayTimeout, wantCode: hmesync.CodeUpstreamError},
+		{name: "upstream", err: hmesync.ErrUpstream, wantStatus: http.StatusBadGateway, wantCode: hmesync.CodeUpstreamError},
+	}
+	path := fmt.Sprintf("/admin/api/v1/accounts/%d/apple-auth", account.ID)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serviceErr = test.err
+			response := env.request(t, http.MethodPost, path, adminAPITestJSON(t, map[string]string{
+				"apple_id": "errors@icloud.com", "password": "not-logged", "region": "global",
+			}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+			if response.Code != test.wantStatus || adminAPITestErrorCode(t, response) != test.wantCode {
+				t.Fatalf("Apple error response = %d; body=%s; want %d %s", response.Code, response.Body.String(), test.wantStatus, test.wantCode)
+			}
+			if test.wantCode == hmesync.CodeAccountActionRequired && !strings.Contains(response.Body.String(), "请前往 Apple 官网处理后重试") {
+				t.Fatalf("Apple account action response omitted actionable message: %s", response.Body.String())
+			}
+			if test.wantCode == "AUTH_REQUIRED" || test.wantCode == "SESSION_EXPIRED" {
+				t.Fatalf("Apple error reused an administrator session code: %s", test.wantCode)
+			}
+		})
+	}
+
+	const secretInError = "cookie-and-token-secret"
+	serviceErr = errors.New("upstream included " + secretInError)
+	redacted := env.request(t, http.MethodPost, path, adminAPITestJSON(t, map[string]string{
+		"apple_id": "errors@icloud.com", "password": "password-secret", "region": "global",
+	}), "application/json", []*http.Cookie{sessionCookie}, csrf)
+	if redacted.Code != http.StatusInternalServerError || adminAPITestErrorCode(t, redacted) != "INTERNAL_ERROR" {
+		t.Fatalf("redacted upstream response = %d; body=%s", redacted.Code, redacted.Body.String())
+	}
+	if strings.Contains(redacted.Body.String(), secretInError) || strings.Contains(logs.String(), secretInError) || strings.Contains(logs.String(), "password-secret") {
+		t.Fatalf("Apple upstream secret reached response or logs: body=%s logs=%s", redacted.Body.String(), logs.String())
+	}
+	audits, err := env.store.ListAuditLogs(context.Background(), 100, 0)
+	if err != nil {
+		t.Fatalf("list error audits: %v", err)
+	}
+	if strings.Contains(fmt.Sprintf("%+v", audits), secretInError) {
+		t.Fatalf("Apple upstream secret reached audit log: %+v", audits)
+	}
+}
+
+func TestAdminAPIAppleSyncReportsCredentialRenderingFailure(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	var logs strings.Builder
+	env.server.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	sessionCookie, csrf, _ := env.createSession(t, "apple-key-fallback-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "fallback@icloud.com")
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
+			alias, err := env.store.CreateAlias(ctx, domain.Alias{
+				AccountID: accountID,
+				Address:   "fallback@privaterelay.appleid.com",
+				Enabled:   true,
+			})
+			if err != nil {
+				return hmesync.SyncResult{}, err
+			}
+			// Simulate corrupted authentication metadata after the database commit.
+			alias.APIKeyHash = []byte("invalid")
+			return hmesync.SyncResult{
+				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
+				Created: []hmesync.CreatedAlias{{Alias: alias}},
+				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated, AppleID: account.Email, Region: hmesync.RegionGlobal},
+			}, nil
+		},
+	})
+	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
+	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusInternalServerError || strings.Contains(response.Body.String(), "api_key") {
+		t.Fatalf("credential rendering failure = %d; body=%s", response.Code, response.Body.String())
+	}
+	if _, err := env.store.GetAliasByAddress(context.Background(), "fallback@privaterelay.appleid.com"); err != nil {
+		t.Fatalf("committed alias missing after fallback response: %v", err)
+	}
+}
+
+func TestAdminAPIAppleSyncRefreshesCommittedAccountDetail(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-refresh-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "refresh@icloud.com")
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
+			created, err := env.store.CreateAlias(ctx, domain.Alias{
+				AccountID: accountID,
+				Address:   "created@privaterelay.appleid.com",
+				Enabled:   true,
+			})
+			if err != nil {
+				return hmesync.SyncResult{}, err
+			}
+			if _, err := env.store.CreateAlias(ctx, domain.Alias{
+				AccountID: accountID,
+				Address:   "concurrent@privaterelay.appleid.com",
+				Enabled:   true,
+			}); err != nil {
+				return hmesync.SyncResult{}, err
+			}
+			return hmesync.SyncResult{
+				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
+				Created: []hmesync.CreatedAlias{{Alias: created}},
+				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated},
+			}, nil
+		},
+	})
+
+	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
+	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK {
+		t.Fatalf("refresh sync response = %d; body=%s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Data struct {
+			Account struct {
+				AliasCount int `json:"alias_count"`
+			} `json:"account"`
+			Aliases []adminAPIAliasDTO             `json:"aliases"`
+			Created []adminAPIAppleCreatedAliasDTO `json:"created"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode refresh sync response: %v; body=%s", err, response.Body.String())
+	}
+	if payload.Data.Account.AliasCount != 2 || len(payload.Data.Aliases) != 2 || len(payload.Data.Created) != 1 ||
+		payload.Data.Created[0].Alias.APIKey == "" {
+		t.Fatalf("refreshed sync payload = %#v", payload.Data)
+	}
+}
+
+func TestAdminAPIAppleSyncKeepsCredentialBundleWhenDetailRefreshFails(t *testing.T) {
+	env := newAdminAPITestEnv(t)
+	sessionCookie, csrf, _ := env.createSession(t, "apple-refresh-fallback-admin", "unused-password")
+	account := adminAPITestCreateAccount(t, env, "refresh-fallback@icloud.com")
+	env.server.SetHMESyncService(&fakeHMESyncService{
+		syncAliases: func(ctx context.Context, accountID int64) (hmesync.SyncResult, error) {
+			alias, err := env.store.CreateAlias(ctx, domain.Alias{
+				AccountID: accountID,
+				Address:   "refresh-fallback@privaterelay.appleid.com",
+				Enabled:   true,
+			})
+			if err != nil {
+				return hmesync.SyncResult{}, err
+			}
+			if err := env.store.Close(); err != nil {
+				return hmesync.SyncResult{}, err
+			}
+			return hmesync.SyncResult{
+				Summary: hmesync.SyncSummary{Total: 1, CreatedCount: 1},
+				Created: []hmesync.CreatedAlias{{Alias: alias}},
+				Session: hmesync.SessionInfo{Status: hmesync.StatusAuthenticated},
+			}, nil
+		},
+	})
+
+	path := fmt.Sprintf("/admin/api/v1/accounts/%d/aliases/sync", account.ID)
+	response := env.request(t, http.MethodPost, path, nil, "", []*http.Cookie{sessionCookie}, csrf)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"api_key":"icm_`) ||
+		!strings.Contains(response.Body.String(), `"detail_stale":true`) {
+		t.Fatalf("refresh fallback sync response = %d; body=%s", response.Code, response.Body.String())
+	}
+}
+
+func adminAPITestCreateAccount(t *testing.T, env *adminAPITestEnv, email string) domain.Account {
+	t.Helper()
+	encrypted, err := env.cipher.Encrypt("app-specific-password")
+	if err != nil {
+		t.Fatalf("encrypt account password: %v", err)
+	}
+	account, err := env.store.CreateAccount(context.Background(), domain.Account{
+		Name:               "Apple API test",
+		Email:              email,
+		IMAPHost:           "imap.mail.me.com",
+		IMAPPort:           993,
+		IMAPUsername:       email,
+		PasswordCiphertext: encrypted,
+		Enabled:            true,
+	})
+	if err != nil {
+		t.Fatalf("create Apple API test account: %v", err)
+	}
+	return account
+}
+
+func adminAPITestCreateDeleteAlias(t *testing.T, env *adminAPITestEnv, accountID int64, address string) domain.Alias {
+	t.Helper()
+	alias, err := env.store.CreateAlias(context.Background(), domain.Alias{
+		AccountID: accountID,
+		Address:   address,
+		Label:     "Delete test alias",
+		Enabled:   true,
+	})
+	if err != nil {
+		t.Fatalf("create delete test alias: %v", err)
+	}
+	return alias
+}
+
+func assertAdminAliasDeleteAudit(t *testing.T, db *store.Store, aliasID int64, result, detail string) {
+	t.Helper()
+	audits, err := db.ListAuditLogs(context.Background(), 100, 0)
+	if err != nil {
+		t.Fatalf("list alias delete audits: %v", err)
+	}
+	resourceID := strconvFormatInt(aliasID)
+	for _, audit := range audits {
+		if audit.Action == "delete" && audit.ResourceType == "alias" && audit.ResourceID == resourceID {
+			if audit.Result != result || audit.Detail != detail {
+				t.Fatalf("alias delete audit = %#v, want result=%q detail=%q", audit, result, detail)
+			}
+			return
+		}
+	}
+	t.Fatalf("alias delete audit for alias %d was not recorded", aliasID)
+}

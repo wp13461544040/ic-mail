@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="icloud-docs-revision" content="2026-10-22-automatic-login-events">
+  <title>iCloud Mail · 接口与接入说明</title>
+  <style>
+    :root{color-scheme:light dark;font:16px/1.7 system-ui,sans-serif;--bg:#f5f5f7;--surface:#fff;--text:#1d1d1f;--muted:#62626a;--line:#d8d8df;--accent:#0066cc}*{box-sizing:border-box}body{max-width:1000px;margin:0 auto;padding:40px 24px 80px;background:var(--bg);color:var(--text)}h1,h2,h3{line-height:1.3}h1{font-size:32px}h2{font-size:24px;margin-top:0}h3{font-size:18px}a{color:var(--accent)}header p,footer{color:var(--muted)}nav{display:flex;flex-wrap:wrap;gap:8px 20px;margin:24px 0}section{background:var(--surface);border:1px solid var(--line);border-radius:18px;padding:24px;margin:20px 0;scroll-margin-top:24px}code,pre{font-family:ui-monospace,monospace}code{overflow-wrap:anywhere}pre{padding:16px;border:1px solid var(--line);border-radius:10px;overflow:auto;background:var(--bg);font-size:13px;line-height:1.6}.note{padding:12px 16px;border-left:3px solid var(--accent);background:var(--bg)}.table-scroll{overflow:auto}table{width:100%;border-collapse:collapse;font-size:14px}th,td{text-align:left;padding:10px;border-bottom:1px solid var(--line);vertical-align:top}footer{font-size:14px}@media(prefers-color-scheme:dark){:root{--bg:#161618;--surface:#222225;--text:#f5f5f7;--muted:#b0b0b8;--line:#44444a;--accent:#70b7ff}}@media(max-width:600px){body{padding:24px 14px 48px}section{padding:18px}h1{font-size:27px}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>iCloud Mail · 接口与接入说明</h1>
+    <p>文档更新：2026-10-22 · v0.2.8。涵盖独立邮箱取码、项目邮箱池、已使用邮箱退役、按需收件、自动创建与自动保活。HOST、ADMIN_PATH 和凭据均为示例占位符。</p>
+  </header>
+  <nav aria-label="文档目录">
+    <a href="#otp">直接取码</a><a href="#pool">邮箱池</a><a href="#retirement">已使用邮箱退役</a><a href="#receiving">收件与并行</a><a href="#limits">限流与重试</a><a href="#creation">自动创建</a><a href="#auto-login">自动保活</a><a href="#imaps">IMAPS / OAuth</a>
+  </nav>
+
+  <section id="otp">
+    <h2>直接取码</h2>
+    <p>使用单邮箱 API Key，或访问后台签发的取件链接。两种方式任选一种，不同时携带两种凭据。浏览器访问或刷新同样触发按需取件。</p>
+    <pre>curl -H "Authorization: Bearer MAILBOX_API_KEY" https://HOST/api/v1/otp
+
+https://HOST/api/v1/otp?token=DERIVED_TOKEN</pre>
+    <p>启用 <code>ICLOUD_API_OTP_RETURN_LATEST_ONLY=true</code> 的部署，有记录时返回归属该邮箱的最新有效验证码：</p>
+    <pre>{"otp":"876543","time":"2026-10-14T15:00:00+08:00"}</pre>
+    <p>没有验证码时返回 <code>200 []</code>。未启用最新模式时返回最新优先的数组，最多 100 条；旧变量 <code>ICLOUD_API_OTP_RETURN_LAST_ONLY</code> 是兼容别名，同时配置以正式变量为准。时间使用部署时区，包含 UTC 偏移。</p>
+    <p>识别主题、纯文本与 HTML 可读文本中独立的六位 ASCII 数字。读取可重复，不消费验证码、不改变邮件已读状态。此接口可包含旧归档；需要区分本次任务的新码时，使用 Pool <code>code</code> 接口的 <code>after</code> 参数。</p>
+    <p class="note">收件地址先完整精确匹配已登记 alias；未命中时，才剥离本地段第一个 <code>+</code> 及其后 tag，保持域名不变，再精确匹配 root。合法 root+tag 邮件可通过 root 取件；未知 root、其他域名及点号近似地址不匹配。完整登记的 + 地址优先归属自身。</p>
+  </section>
+
+  <section id="pool">
+    <h2>项目邮箱池</h2>
+    <p>项目接口使用 <code>Authorization: Bearer pool_PROJECT_KEY</code>。Pool Key 与单邮箱 Key 用途不同，租约仅在所属项目内可用。</p>
+    <pre>curl -X POST https://HOST/api/v1/pool/claim \
+  -H "Authorization: Bearer pool_PROJECT_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"request_id":"task-20261014-0001","count":1,"ttl_seconds":1800}'</pre>
+    <p><code>request_id</code> 必填，8–128 位字母、数字、横线或下划线；<code>count</code> 为 1–50，默认 1；<code>ttl_seconds</code> 为 60–86400，默认 1800。领取前持久化编号和原参数。同项目、同编号、同参数返回原领取；参数变化返回 <code>409 IDEMPOTENCY_CONFLICT</code>。库存不足返回 <code>409 POOL_EMPTY</code>，整批不分配。</p>
+    <p>成功时 <code>data.leases</code> 中每项包含 <code>lease</code> 和仍有效的 <code>mailbox</code> 凭据包。取件可使用 <code>mailbox.code_path</code>。业务确认使用后提交 commit，避免尚未使用的领取到期回收。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>方法与路径</th><th>用途</th></tr></thead><tbody>
+      <tr><td>GET /api/v1/pool/leases</td><td>列出本项目租约；支持 state、limit、offset。</td></tr>
+      <tr><td>GET /api/v1/pool/leases/LEASE_ID</td><td>读取租约；已关闭租约不再返回凭据。</td></tr>
+      <tr><td>POST /api/v1/pool/leases/LEASE_ID/commit</td><td>leased → used，持续保留分配；已使用根邮箱不会被新领取重新分配。</td></tr>
+      <tr><td>POST /api/v1/pool/leases/LEASE_ID/renew</td><td>发送 {"ttl_seconds":1800} 续期。</td></tr>
+      <tr><td>POST /api/v1/pool/leases/LEASE_ID/release</td><td>释放尚未确认使用的领取，轮换邮箱凭据。</td></tr>
+      </tbody></table></div>
+    <h3>本次任务取码与短等待</h3>
+    <pre>curl -H "Authorization: Bearer pool_PROJECT_KEY" \
+  'https://HOST/api/v1/pool/leases/LEASE_ID/code?after=2026-10-14T07%3A00%3A00Z&amp;wait_seconds=15'</pre>
+    <p>查询起点取领取时间与 after 中较晚者；after 使用 RFC3339，带 <code>+</code> 的时区偏移需 URL 编码。<code>wait_seconds</code> 为整数 0–15，默认 0。共享模式下新码到达立即返回；正常无新码到期返回 no_code。同 root 的 +tag 邮件聚合到根租约，子任务顺序由调用项目管理。</p>
+    <pre>{"data":{"success":true,"otp":"876543","time":"2026-10-14T07:00:30Z"}}
+{"data":{"success":false,"code":"no_code","retryable":true}}</pre>
+    <p>HTTP 超时比等待预算多留网络余量。每次检查和最终响应重新核验 Pool Key、项目、live lease 及主号/alias 状态。retiring、retired 或已关闭租约停止取码。</p>
+  </section>
+
+  <section id="retirement">
+    <h2>已使用隐藏邮箱退役</h2>
+    <p>只删除指定项目已领取并已使用的真实隐藏邮箱；不删除 iCloud 主号，不扫描或删除其其他地址。此流程与旧管理批量删除接口独立。</p>
+    <p>ADMIN_PATH 为部署方提供的管理前缀。三个接口均要求管理员 Session 与原项目 Pool Key；POST 还要求同源 CSRF。这里不公开实际管理前缀。</p>
+    <pre>POST /ADMIN_PATH/api/v1/pool/aliases/batch
+GET  /ADMIN_PATH/api/v1/pool/aliases/batch/jobs/OPERATION_ID
+POST /ADMIN_PATH/api/v1/pool/aliases/batch/jobs/OPERATION_ID/reconcile</pre>
+    <pre>curl -X POST 'https://HOST/ADMIN_PATH/api/v1/pool/aliases/batch' \
+  -H 'Cookie: icloud_admin_session=ADMIN_SESSION' \
+  -H 'Origin: https://HOST' \
+  -H 'X-CSRF-Token: ADMIN_CSRF' \
+  -H 'Authorization: Bearer pool_PROJECT_KEY' \
+  -H 'Content-Type: application/json' \
+  -d '{"operation_id":"retire-20261014-0001","items":[{"alias_id":123,"lease_id":"LEASE_ID"}]}'</pre>
+    <p>operation_id 为 16–128 位 ASCII 字母、数字、横线或下划线；items 为 1–100 项。整批预检要求 alias/lease 精确对应、归属当前项目、为唯一 live lease 且状态 used；主号须启用、已认证，alias 须是已确认的真实隐藏邮箱。</p>
+    <p>受理返回 <code>202</code>，事务内将租约置为 retiring，关闭取码、renew、release 和再次 claim。Apple 确认成功后事务收口为 retired，删除本地 alias/pool_member，保留 lease 历史。明确失败恢复 used；远端结果未知或重启中断保持 retiring 与 review / interrupted。</p>
+    <p>同项目、同 operation_id、同顺序 items 重放原作业；内容或项目变化返回 <code>409 IDEMPOTENCY_CONFLICT</code>。GET 与原 POST 重放不重启副作用。GET 返回 200；缺失或其他项目工单返回 <code>404 NOT_FOUND</code>。</p>
+    <pre>{"data":{"operation_id":"retire-20261014-0001","status":"completed","total":1,"processed":1,
+  "items":[{"alias_id":123,"lease_id":"LEASE_ID","state":"retired","result_code":"","result_message":""}],
+  "created_at":"2026-10-14T07:00:00Z","updated_at":"2026-10-14T07:00:30Z"}}</pre>
+    <h3>核验外部退役与显式恢复</h3>
+    <p>向原工单 reconcile 路径 POST 完整原顺序 items 和明确的 resume 值：</p>
+    <pre>{"items":[{"alias_id":123,"lease_id":"LEASE_ID"}],"resume":false}</pre>
+    <p><code>resume=false</code> 仅读完整权威目录，可靠确认原地址不存在时本地收口；仍存在保持 review，逐项码 APPLE_ALIAS_STILL_PRESENT。<code>resume=true</code> 明确授权对目录确认仍存在的原目标继续删除。目录未知保持 review，不盲目重放。成功受理返回 202。</p>
+    <p>核验在途时，同 resume 返回当前快照，不同 resume 返回 <code>409 RETIREMENT_ACTION_CONFLICT</code>。一轮结束后再 POST 可开启下一轮核验；响应丢失先 GET 再决定。逐项常见码：APPLE_RATE_LIMITED、APPLE_UPSTREAM_ERROR、APPLE_DELETE_UNCERTAIN、JOB_INTERRUPTED。响应只含工单、alias/lease 状态和稳定错误码，不返回密钥、Cookie 或邮件。</p>
+  </section>
+
+  <section id="receiving">
+    <h2>按需收件与退役并行</h2>
+    <p>IMAP 增量批次将匹配正文合并为一次 UID FETCH，服务默认每批最多处理 128 条 UID，失败不推进游标；不支持批量正文读取的服务器使用逐封回退。网页正文重建版仅在 Message-ID、旧文件校验和及来源标记核验一致时升级为完整 MIME，保留归档身份与取码记录。</p>
+    <p>默认按需接收。共享模式同主号复用一条 IDLE 通知连接及一条串行读取连接；无有效取件 10 分钟后休眠。取件需求到达且观察超过 5 秒时补查；正常增量按持久化 UID 继续。冷启动或久未同步按服务端日期筛选定位时间窗口，正文限最近 15 分钟，不截断为最后 128 封。待处理时间边界与游标同事务保存，分页及重启继续原窗口；旧 IMAP 服务器可能返回较多日期匹配的 UID 元数据。这些是调度规则，并非投递时延承诺。</p>
+    <p class="note">同主号的 Apple 退役与 IMAP 网络读取可并行。Apple 管理与 IMAP 读取各自按主号串行；保存时用本地事务核验账户配置及每个邮箱身份。退役一个 alias 不再丢弃其他 alias 的整批结果，新加入但未参与本批的地址不会被误标为已同步。</p>
+    <p>IMAP 密码、服务器、用户名、主号启停或收件通道变化使旧观察失效，包括停用后重启、配置切换后切回。retiring 租约立即停止 Pool 取码，其他邮箱继续收件。归档与 UID 同事务提交，未提交批次不推进游标。</p>
+    <p>public IMAPS 仅读本地归档。上游 iCloud IMAP 使用主号配置的 <code>imap.mail.me.com:993</code>、TLS 和 Apple App 专用密码；它与网关签发的单邮箱 IMAP 密码是两套凭据。Apple Account 登录供隐藏邮箱管理使用，重新登录不会替换 IMAP App 专用密码。</p>
+  </section>
+
+  <section id="limits">
+    <h2>限流、空结果与重试</h2>
+    <p>同 root 的链接、Bearer Key 与 Pool code 共用容量 2 的令牌桶，每 2 秒恢复 1 次。额度内的并发读者共享同步，普通读取与 Pool 长等待可共存；结束不追加冷却。被拦截刷新不扣额度、不重置恢复时间。旧非共享模式保留独占和完成后 2 秒冷却。</p>
+    <div class="table-scroll"><table>
+      <thead><tr><th>响应</th><th>处理方式</th></tr></thead><tbody>
+      <tr><td>200 [] / no_code</td><td>正常读取完成，暂时无符合条件的新码；按任务 deadline 继续等待。</td></tr>
+      <tr><td>429 RATE_LIMITED</td><td>按 Retry-After 秒数或 X-Retry-After-Ms 毫秒数重试，不叠加同 root 的多个长等待。</td></tr>
+      <tr><td>503 SYNC_UNAVAILABLE</td><td>本次同步未完成或上游异常；按 Retry-After 与总 deadline 重试，区别于空结果。</td></tr>
+      <tr><td>503 PICKUP_BUSY</td><td>取件容量不足、队满或排队超时；按 Retry-After 重试，并发本身不返回 429。</td></tr>
+      <tr><td>409 LEASE_CLOSED</td><td>租约关闭、到期或退役，停止该租约取件。</td></tr>
+      <tr><td>401 INVALID_API_KEY / INVALID_POOL_KEY</td><td>核对凭据类型、有效性及轮换状态。</td></tr>
+      </tbody></table></div>
+    <p>X-RateLimit-Reason 区分 mailbox_rate、mailbox_cooldown、global_queue、wait_queue、wait_concurrency、global_concurrency、mailbox_capacity；旧非共享路径还可能返回 mailbox_inflight、account_concurrency、global_rate。在途完成时间未知时，只提供建议复查间隔。</p>
+    <p>共享入口取消每主号 64 与每秒 100 次限制；全站允许 512 个在途、入口总计最多 1024 个请求（含排队），排队预算 2 秒。Pool 长等待最多 384 个在途、总计最多 640 个（含排队），为普通读取预留容量。上游仍共享连接并受全局并发及最短 2 秒启动间隔约束。其他 Pool 路由保留每 IP 每分钟 300 次通用额度。容量按服务进程计数。</p>
+    <p>Apple 创建/删除限流与取件桶独立。退役沿用每主号串行、已有批量并发预算及 Apple Retry-After；未知结果先核验原工单。</p>
+  </section>
+
+  <section id="creation">
+    <h2>自动创建与通道恢复</h2>
+    <p>手动与批量创建按实际使用的通道确认原候选，已知来自新通道的待确认项不会阻塞旧通道；来源不明的候选继续先核验。同通道不重复生成，容量、身份和转发目标检查保持。</p>
+    <p>自动创建需在后台主动开启。新通道与旧通道均正常时，每主号每小时最多安排新通道 19 次、旧通道 4 次，共 23 次尝试。</p>
+    <p>新通道过期或退出、旧通道仍正常时，保留计划，分散执行旧通道每小时最多 5 次。新通道重新登录后，后续时间槽自动恢复 19＋4，无需重新开启计划。模式切换和重启均不清空滚动额度或 Apple 冷却。</p>
+    <p>新通道创建、候选完成或详情读取被限流时，只冷却该通道，旧通道按原时间槽与独立额度继续。候选来源及完成 ID 持久保存，取得 ID 后只读取原详情；重复调度不会延长冷却，Apple 更长的 Retry-After 继续生效。目录暂时遗漏地址时可用原 ID 的详情精确核验；结果未知保留候选，历史来源不明项继续先核验原地址。公共会话或目录请求本身被限流时，仍暂停主号计划。</p>
+    <p>旧通道目录失效时暂停远端创建，保留已开启计划；重新登录后继续。创建依赖旧通道目录确认归属和结果，新通道登录态仍需配合目录确认。手动关闭的计划保持关闭，历史关闭项不会在升级时批量重开。</p>
+    <p class="note">次数是本地尝试上限，实际成功数仍取决于 Apple 响应、Retry-After、库存与容量。待确认地址继续核验原候选，未知结果不重复生成。此规则不承诺 Apple 会话长期有效。</p>
+  </section>
+
+  <section id="auto-login">
+    <h2>自动保活与过期重登</h2>
+    <p>在添加主号或编辑收件凭据时，可开启自动保活服务，填写 Apple 登录密码、双重验证接码链接及账户区域。默认关闭，只有启用的 iCloud 主号且主动打开该开关，才会自动重新登录新旧通道。</p>
+    <p>按明确会话失效、已知过期时间和配置变更触发，不每 30 秒扫描哪些通道需要重登。普通 429、创建配额和临时网络故障不会作为新重登理由；失败后间隔重试，遵守 Apple 的等待要求，重复事件不重置退避。密码错误或账户待办会暂停自动尝试，人工登录优先。</p>
+    <p>密码和接码链接加密保存、不回显，验证码不持久化。接码链接须能返回该主号的新验证码；关闭开关不强制填写凭据，编辑留空保留已存值。保持退出前请先关闭自动保活，否则退出事件仍可触发自动重新登录。</p>
+    <p class="note">这是过期后重新登录的补充，不表示新通道永久在线。Apple 管理连接与 IMAP App 专用密码独立，自动重登不会替换收件密码。备份和升级时保留数据库与原密钥。</p>
+  </section>
+
+  <section id="imaps">
+    <h2>只读 IMAPS 与 OAuth</h2>
+    <p>连接部署方提供的 public IMAPS 主机与端口，用户名为登记的隐藏邮箱，密码为网关签发的单邮箱 IMAP 密码。仅提供只读 INBOX，支持 LIST、STATUS、SELECT/EXAMINE、SEARCH、FETCH、UID FETCH 与 IDLE。</p>
+    <p>用 client ID 与 refresh token 换取一小时有效的 XOAUTH2 令牌：</p>
+    <pre>curl -X POST https://HOST/oauth2/v2.0/token \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "grant_type=refresh_token" \
+  --data-urlencode "client_id=CLIENT_ID" \
+  --data-urlencode "refresh_token=REFRESH_TOKEN"</pre>
+    <pre>{"access_token":"ACCESS_TOKEN","token_type":"Bearer","expires_in":3600}</pre>
+    <p>轮换邮箱凭据会同时使旧 API Key、链接、IMAP 密码及 OAuth 凭据失效。领取与回收通过事务和唯一 live lease 约束防止重复分配；used 租约保留，退休后的历史 lease 可有空 alias_id。</p>
+  </section>
+  <footer>文档由网关内置提供，资源全部本地化，无外部脚本或字体请求。旧版 latest/recent 维持原合同，recent 消费语义与上文可重复读取的 OTP / Pool code 不同。</footer>
+</body>
+</html>

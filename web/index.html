@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+    <base href="./">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="light dark">
+    <script defer src="%BASE_URL%assets/theme-init-v1.js"></script>
+    <script defer src="%BASE_URL%assets/startup-recovery-v1.js"></script>
+    <style>
+      .startup-shell{min-height:80vh;display:grid;place-content:center;gap:16px;padding:24px;text-align:center;font:15px/1.6 system-ui,sans-serif;color:#4b5260}
+      .dark .startup-shell{color:#c3c7ce}.startup-shell p{margin:0}.startup-shell button{justify-self:center;padding:10px 20px;border:1px solid #88909d;border-radius:12px;background:transparent;color:inherit;font:inherit;cursor:pointer}.startup-shell [hidden]{display:none}
+      .resource-recovery{position:fixed;z-index:10000;bottom:24px;left:50%;transform:translateX(-50%);width:min(480px,90vw);padding:16px;border:1px solid #a2a8b2;border-radius:16px;background:#f0f2f6;color:#343943;font:14px/1.6 system-ui,sans-serif;box-shadow:0 8px 32px #0002}.dark .resource-recovery{background:#252830;color:#e4e6eb}.resource-recovery[hidden]{display:none}.resource-recovery button{margin-left:12px;padding:4px 10px;border:1px solid currentColor;border-radius:8px;background:transparent;color:inherit;cursor:pointer}
+    </style>
+    <title>iCloud 隐私邮箱</title>
+  </head>
+  <body>
+    <div id="app"><div class="startup-shell" role="status"><p id="startup-message">正在加载控制面板…</p><button id="startup-reload" type="button" hidden>重新加载</button><noscript>请启用浏览器 JavaScript 后刷新页面。</noscript></div></div>
+    <div id="resource-recovery" class="resource-recovery" role="alert" hidden>页面资源加载失败，请重新加载后继续。<button id="resource-reload" type="button">重新加载</button></div>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

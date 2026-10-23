@@ -1,0 +1,1200 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"net/url"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"icloud-api/internal/secure"
+)
+
+var _ LegacySQLiteCipherValidator = (*secure.Cipher)(nil)
+var _ legacyPendingAliasKeyCipherValidator = (*secure.Cipher)(nil)
+
+type legacyCipherValidatorStub struct {
+	credentialValues []string
+	appleValues      []string
+	pendingKeyValues []string
+	err              error
+}
+
+func (validator *legacyCipherValidatorStub) Decrypt(value string) (string, error) {
+	validator.credentialValues = append(validator.credentialValues, value)
+	return "", validator.err
+}
+
+func (validator *legacyCipherValidatorStub) DecryptAppleSession(value string) (string, error) {
+	validator.appleValues = append(validator.appleValues, value)
+	return "", validator.err
+}
+
+func (validator *legacyCipherValidatorStub) DecryptPendingAliasAPIKey(value string) (string, error) {
+	validator.pendingKeyValues = append(validator.pendingKeyValues, value)
+	return "", validator.err
+}
+
+func TestLegacySQLiteReadOnlyDSN(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	databasePath := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE fixture(value TEXT NOT NULL)`); err != nil {
+		_ = db.Close()
+		t.Fatalf("create fixture: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO fixture(value) VALUES('preserved')`); err != nil {
+		_ = db.Close()
+		t.Fatalf("write fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close fixture: %v", err)
+	}
+
+	dsn, resolvedPath, err := legacySQLiteReadOnlyDSN(databasePath)
+	if err != nil {
+		t.Fatalf("build read-only DSN: %v", err)
+	}
+	if resolvedPath != databasePath {
+		t.Fatalf("resolved path = %q, want %q", resolvedPath, databasePath)
+	}
+	if !strings.Contains(dsn, "mode=ro") {
+		t.Fatalf("read-only DSN does not contain mode=ro: %q", dsn)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse read-only DSN: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "1" {
+		t.Fatalf("clean read-only snapshot is not immutable: %q", dsn)
+	}
+
+	readOnly, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open read-only fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = readOnly.Close() })
+	readTx, err := readOnly.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin read-only snapshot: %v", err)
+	}
+	var value string
+	if err := readTx.QueryRowContext(ctx, `SELECT value FROM fixture`).Scan(&value); err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	if value != "preserved" {
+		t.Fatalf("fixture value = %q, want preserved", value)
+	}
+	if err := readTx.Commit(); err != nil {
+		t.Fatalf("commit read-only snapshot: %v", err)
+	}
+	if _, err := readOnly.ExecContext(ctx, `DELETE FROM fixture`); err == nil {
+		t.Fatal("read-only fixture unexpectedly accepted a write")
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNOpensCleanWALDatabaseFromReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory permissions are POSIX-specific")
+	}
+
+	ctx := context.Background()
+	directory := t.TempDir()
+	databasePath := filepath.Join(directory, "legacy.db")
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open WAL fixture: %v", err)
+	}
+	var journalMode string
+	if err := db.QueryRowContext(ctx, `PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		_ = db.Close()
+		t.Fatalf("enable WAL fixture: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		_ = db.Close()
+		t.Fatalf("fixture journal mode = %q, want wal", journalMode)
+	}
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE fixture(value TEXT NOT NULL);
+		INSERT INTO fixture(value) VALUES('preserved');
+	`); err != nil {
+		_ = db.Close()
+		t.Fatalf("write WAL fixture: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close WAL fixture: %v", err)
+	}
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		if _, err := os.Lstat(databasePath + suffix); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("cleanly closed fixture retained %s sidecar: %v", suffix, err)
+		}
+	}
+
+	if err := os.Chmod(databasePath, 0o400); err != nil {
+		t.Fatalf("make WAL fixture read-only: %v", err)
+	}
+	if err := os.Chmod(directory, 0o500); err != nil {
+		t.Fatalf("make WAL fixture directory read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(directory, 0o700) })
+
+	dsn, _, err := legacySQLiteReadOnlyDSN(databasePath)
+	if err != nil {
+		t.Fatalf("build read-only WAL DSN: %v", err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse read-only WAL DSN: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "1" {
+		t.Fatalf("clean WAL snapshot is not immutable: %q", dsn)
+	}
+	readOnly, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open read-only WAL fixture: %v", err)
+	}
+	defer readOnly.Close()
+	var value string
+	if err := readOnly.QueryRowContext(ctx, `SELECT value FROM fixture`).Scan(&value); err != nil {
+		t.Fatalf("read clean WAL fixture from read-only directory: %v", err)
+	}
+	if value != "preserved" {
+		t.Fatalf("read-only WAL fixture value = %q, want preserved", value)
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNReadsUncheckpointedWALFromReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("read-only directory permissions are POSIX-specific")
+	}
+
+	ctx := context.Background()
+	sourceDirectory := t.TempDir()
+	sourcePath := filepath.Join(sourceDirectory, "legacy.db")
+	sourceDB, err := sql.Open("sqlite", sourcePath)
+	if err != nil {
+		t.Fatalf("open WAL source: %v", err)
+	}
+	t.Cleanup(func() { _ = sourceDB.Close() })
+	sourceConn, err := sourceDB.Conn(ctx)
+	if err != nil {
+		t.Fatalf("reserve WAL source connection: %v", err)
+	}
+	t.Cleanup(func() { _ = sourceConn.Close() })
+
+	var journalMode string
+	if err := sourceConn.QueryRowContext(ctx, `PRAGMA journal_mode = WAL`).Scan(&journalMode); err != nil {
+		t.Fatalf("enable WAL source: %v", err)
+	}
+	if strings.ToLower(journalMode) != "wal" {
+		t.Fatalf("source journal mode = %q, want wal", journalMode)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `CREATE TABLE fixture(value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create WAL source schema: %v", err)
+	}
+	var busy, logFrames, checkpointedFrames int
+	if err := sourceConn.QueryRowContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`).Scan(
+		&busy, &logFrames, &checkpointedFrames,
+	); err != nil {
+		t.Fatalf("checkpoint WAL source schema: %v", err)
+	}
+	if busy != 0 || logFrames != 0 || checkpointedFrames != 0 {
+		t.Fatalf(
+			"schema checkpoint result = busy:%d log:%d checkpointed:%d, want 0:0:0",
+			busy, logFrames, checkpointedFrames,
+		)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0`); err != nil {
+		t.Fatalf("disable automatic WAL checkpoints: %v", err)
+	}
+	if _, err := sourceConn.ExecContext(ctx, `INSERT INTO fixture(value) VALUES('wal-only')`); err != nil {
+		t.Fatalf("insert WAL-only row: %v", err)
+	}
+	if info, err := os.Stat(sourcePath + "-wal"); err != nil {
+		t.Fatalf("inspect uncheckpointed WAL: %v", err)
+	} else if info.Size() <= 32 {
+		t.Fatalf("uncheckpointed WAL size = %d, want header and at least one frame", info.Size())
+	}
+
+	copyFixture := func(source, destination string) {
+		t.Helper()
+		contents, err := os.ReadFile(source)
+		if err != nil {
+			t.Fatalf("read SQLite snapshot file %s: %v", source, err)
+		}
+		if err := os.WriteFile(destination, contents, 0o600); err != nil {
+			t.Fatalf("write SQLite snapshot file %s: %v", destination, err)
+		}
+	}
+
+	mainOnlyDirectory := t.TempDir()
+	mainOnlyPath := filepath.Join(mainOnlyDirectory, "legacy.db")
+	copyFixture(sourcePath, mainOnlyPath)
+	mainOnlyURL := &url.URL{Scheme: "file", Path: filepath.ToSlash(mainOnlyPath)}
+	mainOnlyQuery := mainOnlyURL.Query()
+	mainOnlyQuery.Set("mode", "ro")
+	mainOnlyQuery.Set("immutable", "1")
+	mainOnlyURL.RawQuery = mainOnlyQuery.Encode()
+	mainOnly, err := sql.Open("sqlite", mainOnlyURL.String())
+	if err != nil {
+		t.Fatalf("open main-only snapshot: %v", err)
+	}
+	var mainOnlyRows int
+	if err := mainOnly.QueryRowContext(ctx, `SELECT COUNT(*) FROM fixture`).Scan(&mainOnlyRows); err != nil {
+		_ = mainOnly.Close()
+		t.Fatalf("read main-only snapshot: %v", err)
+	}
+	if err := mainOnly.Close(); err != nil {
+		t.Fatalf("close main-only snapshot: %v", err)
+	}
+	if mainOnlyRows != 0 {
+		t.Fatalf("main database already contains %d rows, want WAL-only row", mainOnlyRows)
+	}
+
+	snapshotDirectory := t.TempDir()
+	snapshotPath := filepath.Join(snapshotDirectory, "legacy.db")
+	for _, suffix := range []string{"", "-wal", "-shm"} {
+		copyFixture(sourcePath+suffix, snapshotPath+suffix)
+	}
+	for _, path := range []string{snapshotPath, snapshotPath + "-wal", snapshotPath + "-shm"} {
+		if err := os.Chmod(path, 0o400); err != nil {
+			t.Fatalf("make SQLite snapshot file read-only: %v", err)
+		}
+	}
+	if err := os.Chmod(snapshotDirectory, 0o500); err != nil {
+		t.Fatalf("make SQLite snapshot directory read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(snapshotDirectory, 0o700) })
+
+	dsn, _, err := legacySQLiteReadOnlyDSN(snapshotPath)
+	if err != nil {
+		t.Fatalf("build WAL snapshot DSN: %v", err)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse WAL snapshot DSN: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "" {
+		t.Fatalf("DSN would ignore an uncheckpointed WAL: %q", dsn)
+	}
+
+	readOnly, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		t.Fatalf("open WAL snapshot: %v", err)
+	}
+	defer readOnly.Close()
+	var value string
+	if err := readOnly.QueryRowContext(ctx, `SELECT value FROM fixture`).Scan(&value); err != nil {
+		t.Fatalf("read row from uncheckpointed WAL: %v", err)
+	}
+	if value != "wal-only" {
+		t.Fatalf("WAL snapshot value = %q, want wal-only", value)
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNDecodesFileURIPaths(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "legacy 100%.db")
+	fixture, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open encoded-path fixture: %v", err)
+	}
+	if _, err := fixture.Exec(`CREATE TABLE fixture(value TEXT); INSERT INTO fixture(value) VALUES('ok')`); err != nil {
+		_ = fixture.Close()
+		t.Fatalf("create encoded-path fixture: %v", err)
+	}
+	if err := fixture.Close(); err != nil {
+		t.Fatalf("close encoded-path fixture: %v", err)
+	}
+	normalizedPath := filepath.ToSlash(databasePath)
+	if !strings.HasPrefix(normalizedPath, "/") {
+		normalizedPath = "/" + normalizedPath
+	}
+
+	opaquePath := filepath.ToSlash(databasePath)
+	for _, rawURI := range []string{
+		(&url.URL{Scheme: "file", Path: normalizedPath}).String(),
+		"file:" + url.PathEscape(opaquePath),
+	} {
+		dsn, resolvedPath, err := legacySQLiteReadOnlyDSN(rawURI)
+		if err != nil {
+			t.Fatalf("build read-only DSN for %q: %v", rawURI, err)
+		}
+		if resolvedPath != databasePath {
+			t.Fatalf("resolved path for %q = %q, want %q", rawURI, resolvedPath, databasePath)
+		}
+		if !strings.Contains(dsn, "mode=ro") {
+			t.Fatalf("read-only DSN for %q does not contain mode=ro: %q", rawURI, dsn)
+		}
+		readOnly, err := sql.Open("sqlite", dsn)
+		if err != nil {
+			t.Fatalf("open read-only DSN for %q: %v", rawURI, err)
+		}
+		var value string
+		if err := readOnly.QueryRow(`SELECT value FROM fixture`).Scan(&value); err != nil {
+			_ = readOnly.Close()
+			t.Fatalf("read encoded-path fixture for %q: %v", rawURI, err)
+		}
+		if err := readOnly.Close(); err != nil {
+			t.Fatalf("close read-only DSN for %q: %v", rawURI, err)
+		}
+		if value != "ok" {
+			t.Fatalf("encoded-path fixture value for %q = %q", rawURI, value)
+		}
+	}
+}
+
+func TestLegacySQLiteCopySpecsHandleOlderSchemas(t *testing.T) {
+	t.Parallel()
+
+	v1 := legacySQLiteCopySpecs(false, false, false)
+	if len(v1) != 6 {
+		t.Fatalf("v1 copy spec count = %d, want 6", len(v1))
+	}
+	if !strings.Contains(v1[0].selectSQL, "password_hash, 1, created_at") {
+		t.Fatalf("v1 admin query does not default password_version: %q", v1[0].selectSQL)
+	}
+	if !strings.Contains(v1[1].selectSQL, "admin_id, 1, csrf") {
+		t.Fatalf("v1 session query does not default password_version: %q", v1[1].selectSQL)
+	}
+	aliasSpec := v1[3]
+	if aliasSpec.table != "aliases" || !strings.Contains(aliasSpec.selectSQL, "api_key_prefix") {
+		t.Fatalf("alias copy spec does not preserve API key prefix: %#v", aliasSpec)
+	}
+	if !strings.Contains(aliasSpec.insertSQL, "credential_mode") ||
+		!strings.Contains(aliasSpec.insertSQL, "'legacy'") {
+		t.Fatalf("alias copy spec does not preserve legacy credential mode: %q", aliasSpec.insertSQL)
+	}
+	messageSpec := v1[4]
+	if messageSpec.table != "latest_messages" ||
+		!strings.Contains(messageSpec.selectSQL, "WHERE uid_validity > 0 AND uid > 0") {
+		t.Fatalf("latest message copy spec does not preserve complete valid snapshots: %#v", messageSpec)
+	}
+
+	v3 := legacySQLiteCopySpecs(true, true, true)
+	if len(v3) != 7 || v3[len(v3)-1].table != "apple_web_sessions" {
+		t.Fatalf("v3 copy specs do not include Apple sessions: %#v", v3)
+	}
+	for _, spec := range v3 {
+		if spec.table == "imap_sync_states" {
+			t.Fatal("legacy importer must not synthesize or copy an IMAP cursor")
+		}
+	}
+}
+
+func TestLegacySQLiteAliasCopySpecPreservesLegacyCredentialIdentity(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	if _, err := source.ExecContext(ctx, `
+		CREATE TABLE aliases (
+			id INTEGER PRIMARY KEY,
+			account_id INTEGER NOT NULL,
+			address TEXT NOT NULL,
+			label TEXT NOT NULL,
+			api_key_hash BLOB NOT NULL,
+			api_key_prefix TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			last_sync_status TEXT NOT NULL,
+			last_sync_error TEXT NOT NULL,
+			last_synced_at INTEGER,
+			last_accessed_at INTEGER,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		);
+		CREATE TABLE latest_messages(alias_id INTEGER, uid_validity INTEGER, uid INTEGER);
+	`); err != nil {
+		t.Fatalf("create source alias schema: %v", err)
+	}
+	if _, err := target.ExecContext(ctx, `
+		CREATE TABLE aliases (
+			id INTEGER PRIMARY KEY,
+			account_id INTEGER NOT NULL,
+			address TEXT NOT NULL,
+			label TEXT NOT NULL,
+			api_key_hash BLOB NOT NULL,
+			api_key_prefix TEXT NOT NULL,
+			enabled INTEGER NOT NULL,
+			last_sync_status TEXT NOT NULL,
+			last_sync_error TEXT NOT NULL,
+			last_synced_at INTEGER,
+			last_accessed_at INTEGER,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL,
+			credential_mode TEXT NOT NULL
+		);
+	`); err != nil {
+		t.Fatalf("create target alias schema: %v", err)
+	}
+	apiKeyHash := []byte{0x10, 0x20, 0x30}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO aliases(
+			id, account_id, address, label, api_key_hash, api_key_prefix, enabled,
+			last_sync_status, last_sync_error, last_synced_at, last_accessed_at,
+			created_at, updated_at
+		) VALUES(17, 3, 'legacy@example.test', 'legacy', ?, 'legacy-prefix', 1,
+			'success', '', 101, 102, 103, 104)`, apiKeyHash); err != nil {
+		t.Fatalf("insert source alias: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source alias snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin target alias transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	aliasSpec := legacySQLiteCopySpecs(false, false, false)[3]
+	if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, aliasSpec, nil); err != nil {
+		t.Fatalf("copy legacy alias: %v", err)
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target alias: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source alias snapshot: %v", err)
+	}
+
+	var copiedHash []byte
+	var prefix, mode string
+	if err := target.QueryRowContext(ctx, `
+		SELECT api_key_hash, api_key_prefix, credential_mode FROM aliases WHERE id = 17`,
+	).Scan(&copiedHash, &prefix, &mode); err != nil {
+		t.Fatalf("read copied alias identity: %v", err)
+	}
+	if !bytes.Equal(copiedHash, apiKeyHash) || prefix != "legacy-prefix" || mode != "legacy" {
+		t.Fatalf("copied alias identity = (%x, %q, %q)", copiedHash, prefix, mode)
+	}
+}
+
+func TestLegacySQLiteLatestMessageAndPendingKeyCopySpecsPreserveRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	fixtureSchema := `
+		CREATE TABLE latest_messages (
+			alias_id INTEGER PRIMARY KEY,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			message_id TEXT NOT NULL,
+			internal_date INTEGER NOT NULL,
+			header_date INTEGER,
+			from_json TEXT NOT NULL,
+			to_json TEXT NOT NULL,
+			cc_json TEXT NOT NULL,
+			subject TEXT NOT NULL,
+			text_body TEXT NOT NULL,
+			html_body TEXT NOT NULL,
+			attachments_json TEXT NOT NULL,
+			body_truncated INTEGER NOT NULL,
+			synced_at INTEGER NOT NULL
+		);
+		CREATE TABLE pending_alias_api_keys (
+			alias_id INTEGER PRIMARY KEY,
+			api_key_ciphertext TEXT NOT NULL,
+			created_at INTEGER NOT NULL
+		);
+	`
+	for _, db := range []*sql.DB{source, target} {
+		if _, err := db.ExecContext(ctx, fixtureSchema); err != nil {
+			t.Fatalf("create message fixture schema: %v", err)
+		}
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(9, 4294967295, 4000000000, 'message-id', 101, 99,
+			'["from"]', '["to"]', '["cc"]', 'subject', 'text body', '<p>html body</p>',
+			'["attachment"]', 1, 102);
+		INSERT INTO latest_messages(
+			alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		) VALUES(10, 0, 0, 'invalid-placeholder', 201, NULL,
+			'[]', '[]', '[]', '', '', '', '[]', 0, 202);
+		INSERT INTO pending_alias_api_keys(alias_id, api_key_ciphertext, created_at)
+		VALUES(9, 'ak1.pending-ciphertext', 103);
+	`); err != nil {
+		t.Fatalf("insert source message state: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source message snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin target message transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	messageSpec := legacySQLiteCopySpecs(false, false, false)[4]
+	if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, messageSpec, nil); err != nil {
+		t.Fatalf("copy latest message: %v", err)
+	}
+	validator := &legacyCipherValidatorStub{}
+	if err := copyLegacySQLiteTable(
+		ctx, sourceTx, targetTx, legacySQLitePendingAliasKeyCopySpec(), validator,
+	); err != nil {
+		t.Fatalf("copy pending alias API key: %v", err)
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target message state: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source message snapshot: %v", err)
+	}
+
+	var messageCount int
+	if err := target.QueryRowContext(ctx, `SELECT COUNT(*) FROM latest_messages`).Scan(&messageCount); err != nil {
+		t.Fatalf("count copied latest messages: %v", err)
+	}
+	if messageCount != 1 {
+		t.Fatalf("copied latest message count = %d, want 1 valid row", messageCount)
+	}
+	var (
+		aliasID, uidValidity, uid, internalDate, headerDate, syncedAt int64
+		messageID, fromJSON, toJSON, ccJSON                           string
+		subject, textBody, htmlBody, attachmentsJSON                  string
+		bodyTruncated                                                 bool
+	)
+	if err := target.QueryRowContext(ctx, `
+		SELECT alias_id, uid_validity, uid, message_id, internal_date, header_date,
+			from_json, to_json, cc_json, subject, text_body, html_body,
+			attachments_json, body_truncated, synced_at
+		FROM latest_messages`,
+	).Scan(
+		&aliasID, &uidValidity, &uid, &messageID, &internalDate, &headerDate,
+		&fromJSON, &toJSON, &ccJSON, &subject, &textBody, &htmlBody,
+		&attachmentsJSON, &bodyTruncated, &syncedAt,
+	); err != nil {
+		t.Fatalf("read copied latest message: %v", err)
+	}
+	if aliasID != 9 || uidValidity != 4294967295 || uid != 4000000000 ||
+		messageID != "message-id" || internalDate != 101 || headerDate != 99 ||
+		fromJSON != `["from"]` || toJSON != `["to"]` || ccJSON != `["cc"]` ||
+		subject != "subject" || textBody != "text body" || htmlBody != "<p>html body</p>" ||
+		attachmentsJSON != `["attachment"]` || !bodyTruncated || syncedAt != 102 {
+		t.Fatalf("copied latest message did not preserve every field")
+	}
+
+	var pendingCiphertext string
+	var pendingCreatedAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT api_key_ciphertext, created_at FROM pending_alias_api_keys WHERE alias_id = 9`,
+	).Scan(&pendingCiphertext, &pendingCreatedAt); err != nil {
+		t.Fatalf("read copied pending alias API key: %v", err)
+	}
+	if pendingCiphertext != "ak1.pending-ciphertext" || pendingCreatedAt != 103 ||
+		len(validator.pendingKeyValues) != 1 || validator.pendingKeyValues[0] != pendingCiphertext {
+		t.Fatalf("copied pending alias key = (%q, %d), validated %#v",
+			pendingCiphertext, pendingCreatedAt, validator.pendingKeyValues)
+	}
+}
+
+func TestLegacySQLiteSeenCopySpecsHandleV4ThroughV6(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		statements []string
+		wantTables []string
+	}{
+		{name: "v4 or v5"},
+		{
+			name: "consumption table only",
+			statements: []string{`CREATE TABLE consumed_messages (
+				alias_id INTEGER NOT NULL,
+				uid_validity INTEGER NOT NULL,
+				uid INTEGER NOT NULL,
+				consumed_at INTEGER NOT NULL
+			)`},
+			wantTables: []string{"consumed_messages"},
+		},
+		{
+			name: "seen task table only",
+			statements: []string{`CREATE TABLE imap_seen_tasks (
+				account_id INTEGER NOT NULL,
+				uid_validity INTEGER NOT NULL,
+				uid INTEGER NOT NULL,
+				created_at INTEGER NOT NULL
+			)`},
+			wantTables: []string{"imap_seen_tasks"},
+		},
+		{
+			name: "v6",
+			statements: []string{
+				`CREATE TABLE consumed_messages (
+					alias_id INTEGER NOT NULL,
+					uid_validity INTEGER NOT NULL,
+					uid INTEGER NOT NULL,
+					consumed_at INTEGER NOT NULL
+				)`,
+				`CREATE TABLE imap_seen_tasks (
+					account_id INTEGER NOT NULL,
+					uid_validity INTEGER NOT NULL,
+					uid INTEGER NOT NULL,
+					created_at INTEGER NOT NULL
+				)`,
+			},
+			wantTables: []string{"consumed_messages", "imap_seen_tasks"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			db, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "legacy.db"))
+			if err != nil {
+				t.Fatalf("open legacy fixture: %v", err)
+			}
+			defer db.Close()
+			for _, statement := range test.statements {
+				if _, err := db.Exec(statement); err != nil {
+					t.Fatalf("create legacy fixture table: %v", err)
+				}
+			}
+			tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+			if err != nil {
+				t.Fatalf("begin legacy fixture snapshot: %v", err)
+			}
+			defer tx.Rollback()
+
+			specs, err := legacySQLiteSeenCopySpecs(context.Background(), tx)
+			if err != nil {
+				t.Fatalf("inspect optional v6 tables: %v", err)
+			}
+			if len(specs) != len(test.wantTables) {
+				t.Fatalf("copy spec count = %d, want %d", len(specs), len(test.wantTables))
+			}
+			for index, want := range test.wantTables {
+				if specs[index].table != want {
+					t.Fatalf("copy spec %d table = %q, want %q", index, specs[index].table, want)
+				}
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteSeenCopySpecsPreserveRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	source, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "source.db"))
+	if err != nil {
+		t.Fatalf("open source fixture: %v", err)
+	}
+	defer source.Close()
+	target, err := sql.Open("sqlite", filepath.Join(t.TempDir(), "target.db"))
+	if err != nil {
+		t.Fatalf("open target fixture: %v", err)
+	}
+	defer target.Close()
+
+	statements := []string{
+		`CREATE TABLE consumed_messages (
+			alias_id INTEGER NOT NULL,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			consumed_at INTEGER NOT NULL,
+			PRIMARY KEY(alias_id, uid_validity, uid)
+		)`,
+		`CREATE TABLE imap_seen_tasks (
+			account_id INTEGER NOT NULL,
+			uid_validity INTEGER NOT NULL,
+			uid INTEGER NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY(account_id, uid_validity, uid)
+		)`,
+	}
+	for _, db := range []*sql.DB{source, target} {
+		for _, statement := range statements {
+			if _, err := db.ExecContext(ctx, statement); err != nil {
+				t.Fatalf("create fixture schema: %v", err)
+			}
+		}
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO consumed_messages(alias_id, uid_validity, uid, consumed_at)
+		VALUES(11, 4294967295, 4000000000, 123456789)`); err != nil {
+		t.Fatalf("insert consumed message fixture: %v", err)
+	}
+	if _, err := source.ExecContext(ctx, `
+		INSERT INTO imap_seen_tasks(account_id, uid_validity, uid, created_at)
+		VALUES(22, 4294967294, 3999999999, 987654321)`); err != nil {
+		t.Fatalf("insert seen task fixture: %v", err)
+	}
+
+	sourceTx, err := source.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin source snapshot: %v", err)
+	}
+	defer sourceTx.Rollback()
+	targetTx, err := target.BeginTx(ctx, &sql.TxOptions{})
+	if err != nil {
+		t.Fatalf("begin target transaction: %v", err)
+	}
+	defer targetTx.Rollback()
+	specs, err := legacySQLiteSeenCopySpecs(ctx, sourceTx)
+	if err != nil {
+		t.Fatalf("build v6 copy specs: %v", err)
+	}
+	for _, spec := range specs {
+		if err := copyLegacySQLiteTable(ctx, sourceTx, targetTx, spec, nil); err != nil {
+			t.Fatalf("copy %s: %v", spec.table, err)
+		}
+	}
+	if err := targetTx.Commit(); err != nil {
+		t.Fatalf("commit target fixture: %v", err)
+	}
+	if err := sourceTx.Commit(); err != nil {
+		t.Fatalf("finish source snapshot: %v", err)
+	}
+
+	var aliasID, uidValidity, uid, consumedAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT alias_id, uid_validity, uid, consumed_at FROM consumed_messages`,
+	).Scan(&aliasID, &uidValidity, &uid, &consumedAt); err != nil {
+		t.Fatalf("read copied consumed message: %v", err)
+	}
+	if aliasID != 11 || uidValidity != 4294967295 || uid != 4000000000 || consumedAt != 123456789 {
+		t.Fatalf("copied consumed message = (%d, %d, %d, %d)", aliasID, uidValidity, uid, consumedAt)
+	}
+
+	var accountID, createdAt int64
+	if err := target.QueryRowContext(ctx, `
+		SELECT account_id, uid_validity, uid, created_at FROM imap_seen_tasks`,
+	).Scan(&accountID, &uidValidity, &uid, &createdAt); err != nil {
+		t.Fatalf("read copied seen task: %v", err)
+	}
+	if accountID != 22 || uidValidity != 4294967294 || uid != 3999999999 || createdAt != 987654321 {
+		t.Fatalf("copied seen task = (%d, %d, %d, %d)", accountID, uidValidity, uid, createdAt)
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNDropsUnsafeURIOptions(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "legacy.db")
+	normalizedPath := filepath.ToSlash(databasePath)
+	if !strings.HasPrefix(normalizedPath, "/") {
+		normalizedPath = "/" + normalizedPath
+	}
+	legacyURL := &url.URL{Scheme: "file", Path: normalizedPath}
+	query := legacyURL.Query()
+	query.Set("immutable", "1")
+	query.Add("_pragma", "journal_mode(WAL)")
+	legacyURL.RawQuery = query.Encode()
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(databasePath+suffix, []byte("pending WAL state"), 0o600); err != nil {
+			t.Fatalf("create %s fixture: %v", suffix, err)
+		}
+	}
+
+	dsn, resolvedPath, err := legacySQLiteReadOnlyDSN(legacyURL.String())
+	if err != nil {
+		t.Fatalf("build read-only URI: %v", err)
+	}
+	if resolvedPath != databasePath {
+		t.Fatalf("resolved path = %q, want %q", resolvedPath, databasePath)
+	}
+	parsed, err := url.Parse(dsn)
+	if err != nil {
+		t.Fatalf("parse read-only URI: %v", err)
+	}
+	if parsed.Query().Get("immutable") != "" {
+		t.Fatalf("read-only URI retained immutable option: %q", dsn)
+	}
+	for _, pragma := range parsed.Query()["_pragma"] {
+		if strings.Contains(strings.ToLower(pragma), "journal_mode") {
+			t.Fatalf("read-only URI retained journal_mode pragma: %q", dsn)
+		}
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNNeverIgnoresSQLiteJournals(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		suffixes []string
+	}{
+		{name: "WAL snapshot", suffixes: []string{"-wal", "-shm"}},
+		{name: "rollback journal", suffixes: []string{"-journal"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			for _, suffix := range test.suffixes {
+				if err := os.WriteFile(databasePath+suffix, []byte("pending SQLite sidecar"), 0o600); err != nil {
+					t.Fatalf("create %s fixture: %v", suffix, err)
+				}
+			}
+			dsn, _, err := legacySQLiteReadOnlyDSN(databasePath)
+			if err != nil {
+				t.Fatalf("build read-only DSN: %v", err)
+			}
+			parsed, err := url.Parse(dsn)
+			if err != nil {
+				t.Fatalf("parse read-only DSN: %v", err)
+			}
+			if parsed.Query().Get("immutable") != "" {
+				t.Fatalf("DSN would ignore existing %s: %q", test.name, dsn)
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNRejectsIncompleteJournalState(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		suffixes []string
+	}{
+		{name: "WAL without SHM", suffixes: []string{"-wal"}},
+		{name: "SHM without WAL", suffixes: []string{"-shm"}},
+		{name: "WAL mixed with rollback journal", suffixes: []string{"-wal", "-shm", "-journal"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			for _, suffix := range test.suffixes {
+				if err := os.WriteFile(databasePath+suffix, []byte("SQLite sidecar"), 0o600); err != nil {
+					t.Fatalf("create %s fixture: %v", suffix, err)
+				}
+			}
+			if _, _, err := legacySQLiteReadOnlyDSN(databasePath); err == nil {
+				t.Fatalf("incomplete journal state %v was accepted", test.suffixes)
+			}
+		})
+	}
+}
+
+func TestInspectLegacySQLiteSourceRejectsOrphanSidecars(t *testing.T) {
+	t.Parallel()
+
+	databasePath := filepath.Join(t.TempDir(), "legacy.db")
+	for _, suffix := range []string{"-wal", "-shm"} {
+		if err := os.WriteFile(databasePath+suffix, []byte("orphan WAL state"), 0o600); err != nil {
+			t.Fatalf("create orphan %s: %v", suffix, err)
+		}
+	}
+	if _, _, err := inspectLegacySQLiteSource(databasePath); err == nil ||
+		!strings.Contains(err.Error(), "database is missing") {
+		t.Fatalf("orphan SQLite source error = %v", err)
+	}
+}
+
+func TestVerifyLegacySQLiteSourceUnchangedDetectsChanges(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, string)
+	}{
+		{
+			name: "database content",
+			mutate: func(t *testing.T, databasePath string) {
+				t.Helper()
+				if err := os.WriteFile(databasePath, []byte("changed source contents"), 0o600); err != nil {
+					t.Fatalf("change source fixture: %v", err)
+				}
+			},
+		},
+		{
+			name: "new journal sidecar",
+			mutate: func(t *testing.T, databasePath string) {
+				t.Helper()
+				if err := os.WriteFile(databasePath+"-journal", []byte("new journal"), 0o600); err != nil {
+					t.Fatalf("create concurrent journal fixture: %v", err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			databasePath := filepath.Join(t.TempDir(), "legacy.db")
+			if err := os.WriteFile(databasePath, []byte("stable source"), 0o600); err != nil {
+				t.Fatalf("create source fixture: %v", err)
+			}
+			state, exists, err := inspectLegacySQLiteSource(databasePath)
+			if err != nil || !exists {
+				t.Fatalf("inspect source fixture = (%v, %v), want existing source", exists, err)
+			}
+			if err := verifyLegacySQLiteSourceUnchanged(databasePath, state); err != nil {
+				t.Fatalf("unchanged source rejected: %v", err)
+			}
+
+			test.mutate(t, databasePath)
+			if err := verifyLegacySQLiteSourceUnchanged(databasePath, state); err == nil ||
+				!strings.Contains(err.Error(), "source changed during import") {
+				t.Fatalf("changed source verification error = %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacySQLiteReadOnlyDSNRejectsNonRegularSidecars(t *testing.T) {
+	tests := []struct {
+		name                   string
+		suffix                 string
+		kind                   string
+		precedingRegularSuffix string
+		windowsSkip            bool
+	}{
+		{name: "WAL directory", suffix: "-wal", kind: "directory"},
+		{
+			name:                   "SHM symbolic link after regular WAL",
+			suffix:                 "-shm",
+			kind:                   "symlink",
+			precedingRegularSuffix: "-wal",
+			windowsSkip:            true,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if test.windowsSkip && runtime.GOOS == "windows" {
+				t.Skip("symbolic link creation may require elevated privileges on Windows")
+			}
+
+			directory := t.TempDir()
+			databasePath := filepath.Join(directory, "legacy.db")
+			sidecarPath := databasePath + test.suffix
+			if test.precedingRegularSuffix != "" {
+				if err := os.WriteFile(
+					databasePath+test.precedingRegularSuffix,
+					[]byte("regular preceding sidecar"),
+					0o600,
+				); err != nil {
+					t.Fatalf("create preceding regular sidecar: %v", err)
+				}
+			}
+			switch test.kind {
+			case "directory":
+				if err := os.Mkdir(sidecarPath, 0o700); err != nil {
+					t.Fatalf("create sidecar directory: %v", err)
+				}
+			case "symlink":
+				targetPath := filepath.Join(directory, "sidecar-target")
+				if err := os.WriteFile(targetPath, []byte("sidecar"), 0o600); err != nil {
+					t.Fatalf("create sidecar link target: %v", err)
+				}
+				if err := os.Symlink(targetPath, sidecarPath); err != nil {
+					t.Fatalf("create sidecar symbolic link: %v", err)
+				}
+			default:
+				t.Fatalf("unknown sidecar fixture kind %q", test.kind)
+			}
+
+			if _, _, err := legacySQLiteReadOnlyDSN(databasePath); err == nil {
+				t.Fatalf("non-regular %s sidecar was accepted", test.suffix)
+			} else if !strings.Contains(err.Error(), "not a regular file") ||
+				!strings.Contains(err.Error(), sidecarPath) {
+				t.Fatalf("non-regular %s sidecar error = %v", test.suffix, err)
+			}
+		})
+	}
+}
+
+func TestImportLegacySQLiteRequiresCiphertextValidator(t *testing.T) {
+	t.Parallel()
+
+	database := &Store{}
+	if err := database.ImportLegacySQLite(context.Background(), "legacy.db"); err == nil ||
+		!strings.Contains(err.Error(), "ciphertext validator") {
+		t.Fatalf("unvalidated legacy import error = %v", err)
+	}
+}
+
+func TestWrapLegacySQLiteImportErrorPreservesClassificationAndCause(t *testing.T) {
+	t.Parallel()
+
+	sourceErr := errors.New("legacy source unavailable")
+	wrapped := wrapLegacySQLiteImportError(sourceErr)
+	if !errors.Is(wrapped, ErrLegacySQLiteImport) || !errors.Is(wrapped, sourceErr) {
+		t.Fatalf("wrapped legacy error does not preserve classification and cause: %v", wrapped)
+	}
+	if rewrapped := wrapLegacySQLiteImportError(wrapped); rewrapped != wrapped {
+		t.Fatalf("already classified legacy error was wrapped again: %v", rewrapped)
+	}
+}
+
+func TestLegacySQLiteSequenceKeepsDeletedHighWatermark(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	db, err := sql.Open("sqlite", ":memory:")
+	if err != nil {
+		t.Fatalf("open fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if _, err := db.ExecContext(ctx, `
+		CREATE TABLE admins(id INTEGER PRIMARY KEY AUTOINCREMENT);
+		INSERT INTO admins(id) VALUES(42);
+		DELETE FROM admins WHERE id = 42;`); err != nil {
+		t.Fatalf("create sequence fixture: %v", err)
+	}
+
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin fixture snapshot: %v", err)
+	}
+	defer tx.Rollback()
+	sequence, err := legacySQLiteSequence(ctx, tx, "admins")
+	if err != nil {
+		t.Fatalf("read legacy sequence: %v", err)
+	}
+	if sequence != 42 {
+		t.Fatalf("legacy sequence = %d, want 42", sequence)
+	}
+}
+
+func TestValidateLegacySQLiteCiphertext(t *testing.T) {
+	t.Parallel()
+
+	validator := &legacyCipherValidatorStub{}
+	account := make([]any, 13)
+	account[6] = "v1.account-ciphertext"
+	if err := validateLegacySQLiteCiphertext("accounts", account, validator); err != nil {
+		t.Fatalf("validate account ciphertext: %v", err)
+	}
+	appleSession := make([]any, 8)
+	appleSession[1] = "as1.apple-ciphertext"
+	if err := validateLegacySQLiteCiphertext("apple_web_sessions", appleSession, validator); err != nil {
+		t.Fatalf("validate Apple session ciphertext: %v", err)
+	}
+	pendingKey := []any{int64(42), "ak1.pending-key-ciphertext", int64(123)}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pendingKey, validator); err != nil {
+		t.Fatalf("validate pending alias API key ciphertext: %v", err)
+	}
+	if len(validator.credentialValues) != 1 || validator.credentialValues[0] != account[6] {
+		t.Fatalf("validated account ciphertexts = %#v", validator.credentialValues)
+	}
+	if len(validator.appleValues) != 1 || validator.appleValues[0] != appleSession[1] {
+		t.Fatalf("validated Apple ciphertexts = %#v", validator.appleValues)
+	}
+	if len(validator.pendingKeyValues) != 1 || validator.pendingKeyValues[0] != pendingKey[1] {
+		t.Fatalf("validated pending API key ciphertexts = %#v", validator.pendingKeyValues)
+	}
+
+	validator.err = sql.ErrNoRows
+	if err := validateLegacySQLiteCiphertext("accounts", account, validator); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("validator error = %v, want wrapped sentinel", err)
+	}
+	if err := validateLegacySQLiteCiphertext("aliases", []any{"not encrypted"}, validator); err != nil {
+		t.Fatalf("unrelated table validation error: %v", err)
+	}
+}
+
+func TestPrepareLegacySQLiteValuesNormalizesPostgresTextAfterCipherValidation(t *testing.T) {
+	t.Parallel()
+
+	validator := &legacyCipherValidatorStub{}
+	account := make([]any, 13)
+	account[6] = "raw\x00cipher"
+	if err := prepareLegacySQLiteValues("accounts", account, validator); err != nil {
+		t.Fatalf("prepare account values: %v", err)
+	}
+	if len(validator.credentialValues) != 1 || validator.credentialValues[0] != "raw\x00cipher" {
+		t.Fatalf("ciphertext was not validated before normalization: %#v", validator.credentialValues)
+	}
+	if account[6] != "raw\x00cipher" {
+		t.Fatalf("ciphertext changed after validation: %q", account[6])
+	}
+
+	message := make([]any, 15)
+	message[3] = "message\x00id"
+	message[9] = string([]byte{'s', 0xff, 'u', 'b'})
+	message[10] = "text\x00body"
+	message[11] = string([]byte{0xfe, 'h', 't', 'm', 'l'})
+	if err := prepareLegacySQLiteValues("latest_messages", message, validator); err != nil {
+		t.Fatalf("prepare latest message values: %v", err)
+	}
+	for index, want := range map[int]string{
+		3:  "message\uFFFDid",
+		9:  "s\uFFFDub",
+		10: "text\uFFFDbody",
+		11: "\uFFFDhtml",
+	} {
+		if message[index] != want {
+			t.Fatalf("latest_messages value %d = %q, want %q", index, message[index], want)
+		}
+	}
+}
+
+func TestValidateLegacySQLiteCiphertextRejectsWrongMasterKey(t *testing.T) {
+	t.Parallel()
+
+	correct, err := secure.NewCipher(bytes.Repeat([]byte{0x31}, 32))
+	if err != nil {
+		t.Fatalf("create correct cipher: %v", err)
+	}
+	wrong, err := secure.NewCipher(bytes.Repeat([]byte{0x32}, 32))
+	if err != nil {
+		t.Fatalf("create wrong cipher: %v", err)
+	}
+	credential, err := correct.Encrypt("app-specific-password")
+	if err != nil {
+		t.Fatalf("encrypt credential: %v", err)
+	}
+	account := make([]any, 13)
+	account[6] = credential
+	if err := validateLegacySQLiteCiphertext("accounts", account, correct); err != nil {
+		t.Fatalf("correct master key rejected: %v", err)
+	}
+	if err := validateLegacySQLiteCiphertext("accounts", account, wrong); err == nil {
+		t.Fatal("wrong master key accepted legacy ciphertext")
+	}
+	pendingKey, err := correct.EncryptPendingAliasAPIKey("legacy-api-key")
+	if err != nil {
+		t.Fatalf("encrypt pending alias API key: %v", err)
+	}
+	pending := []any{int64(1), pendingKey, int64(123)}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pending, correct); err != nil {
+		t.Fatalf("correct master key rejected pending alias API key: %v", err)
+	}
+	if err := validateLegacySQLiteCiphertext("pending_alias_api_keys", pending, wrong); err == nil {
+		t.Fatal("wrong master key accepted pending alias API key")
+	}
+}

@@ -1,0 +1,439 @@
+package config
+
+import (
+	"strings"
+	"testing"
+	"time"
+)
+
+var configEnvironment = []string{
+	"ICLOUD_API_ADDR",
+	"ICLOUD_API_DATABASE_URL",
+	"ICLOUD_API_LEGACY_SQLITE",
+	"ICLOUD_API_WEB_ROOT",
+	"ICLOUD_API_MASTER_KEY_FILE",
+	"ICLOUD_API_OAUTH_TOKEN",
+	"ICLOUD_API_ADMIN_USER",
+	"ICLOUD_API_ADMIN_PASSWORD",
+	"ICLOUD_API_COOKIE_SECURE",
+	"ICLOUD_API_SESSION_TTL",
+	"ICLOUD_API_POLL_INTERVAL",
+	"ICLOUD_API_IMAP_IDLE_ENABLED",
+	"ICLOUD_API_MAIL_ON_DEMAND_ONLY",
+	"ICLOUD_API_IMAP_FALLBACK_INTERVAL",
+	"ICLOUD_API_IMAP_TIMEOUT",
+	"ICLOUD_API_SYNC_TIMEOUT",
+	"ICLOUD_API_SYNC_CONCURRENCY",
+	"ICLOUD_API_SHUTDOWN_TIMEOUT",
+	"ICLOUD_API_MAX_MESSAGE_BYTES",
+	"ICLOUD_API_MAX_BODY_BYTES",
+	"ICLOUD_API_OTP_RETURN_LAST_ONLY",
+	"ICLOUD_API_OTP_RETURN_LATEST_ONLY",
+	"ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS",
+	"ICLOUD_API_TRUSTED_PROXIES",
+	"GIN_MODE",
+	"TZ",
+}
+
+func TestDatabaseURLDefault(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "postgres://icloud_api@/icloud_api?host=/var/run/postgresql&sslmode=disable"
+	if cfg.DatabaseURL != want {
+		t.Fatalf("默认数据库 URL = %q, want %q", cfg.DatabaseURL, want)
+	}
+}
+
+func TestLegacySQLitePathConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacySQLitePath != "" {
+		t.Fatalf("默认旧 SQLite 路径 = %q, want empty", cfg.LegacySQLitePath)
+	}
+
+	t.Setenv("ICLOUD_API_LEGACY_SQLITE", "  /app/legacy/icloud-api.db  ")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.LegacySQLitePath != "/app/legacy/icloud-api.db" {
+		t.Fatalf("旧 SQLite 路径 = %q, want 已去除首尾空白的配置值", cfg.LegacySQLitePath)
+	}
+}
+
+func TestDatabaseURLOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_DATABASE_URL", "  postgres://app@db/app?sslmode=disable  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DatabaseURL != "postgres://app@db/app?sslmode=disable" {
+		t.Fatalf("数据库 URL = %q, want 已去除首尾空白的配置值", cfg.DatabaseURL)
+	}
+}
+
+func TestDatabaseURLValidation(t *testing.T) {
+	for _, value := range []string{
+		"data/icloud-api.db",
+		"file:data/icloud-api.db",
+		"sqlite://data/icloud-api.db",
+		"postgres:data/icloud-api.db",
+		"postgresql:data/icloud-api.db",
+		"postgres:/data/icloud-api.db",
+		"postgresql:/data/icloud-api.db",
+		"POSTGRES:data/icloud-api.db",
+		"postgres://%zz",
+		"://invalid",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_DATABASE_URL", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_DATABASE_URL") {
+				t.Fatalf("ICLOUD_API_DATABASE_URL=%q 错误 = %v", value, err)
+			}
+		})
+	}
+}
+
+func TestPostgreSQLSchemeIsAccepted(t *testing.T) {
+	for _, value := range []string{
+		"postgresql://app@db/app?sslmode=disable",
+		"POSTGRES://app@db/app?sslmode=disable",
+		"postgres://app@/app?host=/var/run/postgresql&sslmode=disable",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_DATABASE_URL", value)
+			if _, err := Load(); err != nil {
+				t.Fatalf("合法 PostgreSQL 数据库 URL %q 不应被拒绝: %v", value, err)
+			}
+		})
+	}
+}
+
+func TestMasterKeyFileDefaultDoesNotDependOnDatabaseURL(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_DATABASE_URL", "postgres://app@db/app?sslmode=disable")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MasterKeyFile != "data/master.key" {
+		t.Fatalf("默认主密钥文件 = %q, want %q", cfg.MasterKeyFile, "data/master.key")
+	}
+}
+
+func TestLegacyOAuthTokenConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	const token = "legacy-oauth-token-012345678901234567890123456789"
+	t.Setenv("ICLOUD_API_OAUTH_TOKEN", token)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("legacy OAuth token should be accepted: %v", err)
+	}
+	if cfg.OAuthToken != token {
+		t.Fatalf("OAuth token = %q, want configured token", cfg.OAuthToken)
+	}
+}
+
+func TestWebRootOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_WEB_ROOT", "  /app/web  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebRoot != "/app/web" {
+		t.Fatalf("前端目录 = %q, want %q", cfg.WebRoot, "/app/web")
+	}
+}
+
+func TestPollIntervalBoundaries(t *testing.T) {
+	for _, value := range []string{"10s", "24h"} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_POLL_INTERVAL", value)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("ICLOUD_API_POLL_INTERVAL=%q 不应被拒绝: %v", value, err)
+			}
+			if 3*cfg.PollInterval > 72*time.Hour {
+				t.Fatalf("三倍轮询周期 = %v, want 不超过 72h", 3*cfg.PollInterval)
+			}
+		})
+	}
+}
+
+func TestPollIntervalValidation(t *testing.T) {
+	for _, value := range []string{
+		"9.999999999s",
+		"24h0.000000001s",
+		"2562047h47m16.854775807s",
+		"not-a-duration",
+	} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_POLL_INTERVAL", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_POLL_INTERVAL") {
+				t.Fatalf("ICLOUD_API_POLL_INTERVAL=%q 错误 = %v", value, err)
+			}
+		})
+	}
+}
+
+func TestIMAPIdleConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.IMAPIdleEnabled || cfg.IMAPFallbackInterval != 15*time.Minute {
+		t.Fatalf("defaults = %v/%v, want true/15m", cfg.IMAPIdleEnabled, cfg.IMAPFallbackInterval)
+	}
+	for _, tc := range []struct {
+		enabled, fallback string
+		want              bool
+		duration          time.Duration
+	}{
+		{"false", "1m", false, time.Minute}, {"true", "24h", true, 24 * time.Hour},
+	} {
+		t.Run(tc.enabled+"/"+tc.fallback, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_IMAP_IDLE_ENABLED", tc.enabled)
+			t.Setenv("ICLOUD_API_IMAP_FALLBACK_INTERVAL", tc.fallback)
+			got, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.IMAPIdleEnabled != tc.want || got.IMAPFallbackInterval != tc.duration {
+				t.Fatalf("got %v/%v", got.IMAPIdleEnabled, got.IMAPFallbackInterval)
+			}
+		})
+	}
+}
+
+func TestMailOnDemandOnlyConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil || !cfg.MailOnDemandOnly {
+		t.Fatalf("default MailOnDemandOnly = %v, err=%v; want true", cfg.MailOnDemandOnly, err)
+	}
+	for _, tc := range []struct {
+		value string
+		want  bool
+	}{{"true", true}, {"false", false}} {
+		t.Setenv("ICLOUD_API_MAIL_ON_DEMAND_ONLY", tc.value)
+		cfg, err := Load()
+		if err != nil || cfg.MailOnDemandOnly != tc.want {
+			t.Fatalf("value %q = %v, err=%v", tc.value, cfg.MailOnDemandOnly, err)
+		}
+	}
+	t.Setenv("ICLOUD_API_MAIL_ON_DEMAND_ONLY", "maybe")
+	if _, err := Load(); err == nil {
+		t.Fatal("invalid MailOnDemandOnly value accepted")
+	}
+}
+
+func TestIMAPIdleConfigurationValidation(t *testing.T) {
+	for name, values := range map[string][]string{"ICLOUD_API_IMAP_IDLE_ENABLED": []string{"maybe", "yes"}, "ICLOUD_API_IMAP_FALLBACK_INTERVAL": []string{"59s", "24h1s", "nope"}} {
+		for _, value := range values {
+			t.Run(name+"/"+value, func(t *testing.T) {
+				clearConfigEnvironment(t)
+				t.Setenv(name, value)
+				if _, err := Load(); err == nil || !strings.Contains(err.Error(), name) {
+					t.Fatalf("error=%v", err)
+				}
+			})
+		}
+	}
+}
+
+func clearConfigEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range configEnvironment {
+		t.Setenv(name, "")
+	}
+}
+
+func TestSyncTimeoutDefault(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PollInterval != 10*time.Second || cfg.IMAPTimeout != 8*time.Second ||
+		cfg.SyncTimeout != 70*time.Second {
+		t.Fatalf(
+			"default mail timing = poll:%v IMAP:%v sync:%v, want 10s/8s/70s",
+			cfg.PollInterval,
+			cfg.IMAPTimeout,
+			cfg.SyncTimeout,
+		)
+	}
+	if cfg.MaxMessageBytes != 100<<20 || cfg.MaxBodyBytes != 512<<10 {
+		t.Fatalf(
+			"default mail byte limits = message:%d body:%d, want %d/%d",
+			cfg.MaxMessageBytes,
+			cfg.MaxBodyBytes,
+			100<<20,
+			512<<10,
+		)
+	}
+}
+
+func TestSyncTimeoutOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "5s")
+	t.Setenv("ICLOUD_API_SYNC_TIMEOUT", "17s")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.SyncTimeout != 17*time.Second {
+		t.Fatalf("同步总时限 = %v, want %v", cfg.SyncTimeout, 17*time.Second)
+	}
+}
+
+func TestSyncTimeoutValidation(t *testing.T) {
+	for _, value := range []string{"9s", "30m1s", "not-a-duration"} {
+		t.Run(value, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_SYNC_TIMEOUT", value)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_SYNC_TIMEOUT") {
+				t.Fatalf("ICLOUD_API_SYNC_TIMEOUT=%q 错误 = %v", value, err)
+			}
+		})
+	}
+}
+
+func TestSyncTimeoutMustCoverTwoIMAPTimeouts(t *testing.T) {
+	for _, syncTimeout := range []string{"24s", "25s", "49s"} {
+		t.Run(syncTimeout, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "25s")
+			t.Setenv("ICLOUD_API_SYNC_TIMEOUT", syncTimeout)
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), "ICLOUD_API_SYNC_TIMEOUT 必须至少为 ICLOUD_API_IMAP_TIMEOUT 的两倍") {
+				t.Fatalf("不一致的同步/IMAP 超时错误 = %v", err)
+			}
+		})
+	}
+}
+
+func TestSyncTimeoutAllowsTwiceIMAPTimeout(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("ICLOUD_API_IMAP_TIMEOUT", "25s")
+	t.Setenv("ICLOUD_API_SYNC_TIMEOUT", "50s")
+	if _, err := Load(); err != nil {
+		t.Fatalf("两倍 IMAP 超时的同步总时限不应被拒绝: %v", err)
+	}
+}
+
+func TestTimezoneDefault(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timezone != time.Local {
+		t.Fatalf("默认时区 = %v, want time.Local", cfg.Timezone)
+	}
+}
+
+func TestOTPReturnLatestOnlyConfiguration(t *testing.T) {
+	clearConfigEnvironment(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OTPReturnLatestOnly {
+		t.Fatal("默认不应只返回最新 OTP")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("旧配置 ICLOUD_API_OTP_RETURN_LAST_ONLY=true 未兼容")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LATEST_ONLY", "false")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.OTPReturnLatestOnly {
+		t.Fatal("正式配置 false 应覆盖旧配置 true")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LATEST_ONLY", "true")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("ICLOUD_API_OTP_RETURN_LATEST_ONLY=true 未生效")
+	}
+
+	t.Setenv("ICLOUD_API_OTP_RETURN_LAST_ONLY", "not-a-bool")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("正式配置已设置时不应解析旧配置: %v", err)
+	}
+	if !cfg.OTPReturnLatestOnly {
+		t.Fatal("正式配置 true 应覆盖无效旧配置")
+	}
+}
+
+func TestOTPReturnLatestOnlyValidation(t *testing.T) {
+	for _, name := range []string{
+		"ICLOUD_API_OTP_RETURN_LAST_ONLY",
+		"ICLOUD_API_OTP_RETURN_LATEST_ONLY",
+	} {
+		t.Run(name, func(t *testing.T) {
+			clearConfigEnvironment(t)
+			t.Setenv(name, "not-a-bool")
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), name) {
+				t.Fatalf("无效 OTP 单条开关错误 = %v, want 包含 %s", err, name)
+			}
+		})
+	}
+}
+
+func TestTimezoneOverride(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("TZ", "  Asia/Shanghai  ")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Timezone == nil || cfg.Timezone.String() != "Asia/Shanghai" {
+		t.Fatalf("时区 = %v, want Asia/Shanghai", cfg.Timezone)
+	}
+	_, offset := time.Date(2026, time.August, 7, 12, 0, 0, 0, time.UTC).In(cfg.Timezone).Zone()
+	if offset != 8*60*60 {
+		t.Fatalf("Asia/Shanghai UTC 偏移 = %d, want %d", offset, 8*60*60)
+	}
+}
+
+func TestTimezoneValidation(t *testing.T) {
+	clearConfigEnvironment(t)
+	t.Setenv("TZ", "not/a-real-timezone")
+	_, err := Load()
+	if err == nil || !strings.Contains(err.Error(), "TZ") {
+		t.Fatalf("无效 TZ 错误 = %v, want 包含 TZ", err)
+	}
+}

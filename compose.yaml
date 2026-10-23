@@ -1,0 +1,117 @@
+services:
+  icloud-api:
+    container_name: icloud-api
+    image: ${ICLOUD_API_IMAGE:-ghcr.io/t508708/icloud-mail:latest}
+    pull_policy: always
+    restart: unless-stopped
+    stop_grace_period: 2m
+    deploy:
+      replicas: 1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${ICLOUD_API_PORT:-8080}:8080"
+      - "127.0.0.1:${ICLOUD_API_IMAPS_PORT:-1993}:1993"
+    environment:
+      GIN_MODE: release
+      ICLOUD_API_ADDR: 0.0.0.0:8080
+      ICLOUD_API_DATABASE_CONFIG_DIR: /run/icloud-api-database
+      ICLOUD_API_INSTALLATION_STATE_DIR: /run/icloud-api-installation
+      ICLOUD_API_LEGACY_SQLITE: /app/legacy/icloud-api.db
+      ICLOUD_API_WEB_ROOT: /app/web
+      ICLOUD_API_MASTER_KEY: ${ICLOUD_API_MASTER_KEY:-}
+      ICLOUD_API_MASTER_KEY_FILE: /app/keys/master.key
+      ICLOUD_API_ADMIN_PATH_FILE: /app/keys/admin-path
+      ICLOUD_API_ADMIN_PATH: ${ICLOUD_API_ADMIN_PATH:-}
+      ICLOUD_API_MAIL_CONTENT_DIR: /app/mail-archive
+      ICLOUD_API_MAIL_CONTENT_LIMIT_BYTES: ${ICLOUD_API_MAIL_CONTENT_LIMIT_BYTES:-10737418240}
+      ICLOUD_API_PUBLIC_IMAP_ADDR: 0.0.0.0:1993
+      ICLOUD_API_PUBLIC_IMAP_SERVER_NAME: ${ICLOUD_API_PUBLIC_IMAP_SERVER_NAME:-localhost}
+      ICLOUD_API_PUBLIC_IMAP_TLS_CERT_FILE: ${ICLOUD_API_PUBLIC_IMAP_TLS_CERT_FILE:-}
+      ICLOUD_API_PUBLIC_IMAP_TLS_KEY_FILE: ${ICLOUD_API_PUBLIC_IMAP_TLS_KEY_FILE:-}
+      ICLOUD_API_ADMIN_USER: ${ICLOUD_API_ADMIN_USER:-admin}
+      ICLOUD_API_ADMIN_PASSWORD: ${ICLOUD_API_ADMIN_PASSWORD:-}
+      ICLOUD_API_OAUTH_TOKEN: ${ICLOUD_API_OAUTH_TOKEN:-}
+      ICLOUD_API_COOKIE_SECURE: ${ICLOUD_API_COOKIE_SECURE:-false}
+      ICLOUD_API_SESSION_TTL: ${ICLOUD_API_SESSION_TTL:-8h}
+      ICLOUD_API_POLL_INTERVAL: ${ICLOUD_API_POLL_INTERVAL:-10s}
+      ICLOUD_API_IMAP_IDLE_ENABLED: ${ICLOUD_API_IMAP_IDLE_ENABLED:-true}
+      ICLOUD_API_MAIL_ON_DEMAND_ONLY: ${ICLOUD_API_MAIL_ON_DEMAND_ONLY:-true}
+      ICLOUD_API_IMAP_FALLBACK_INTERVAL: ${ICLOUD_API_IMAP_FALLBACK_INTERVAL:-15m}
+      ICLOUD_API_IMAP_TIMEOUT: ${ICLOUD_API_IMAP_TIMEOUT:-8s}
+      # Per-account full sync deadline; keep it at least twice IMAP_TIMEOUT.
+      ICLOUD_API_SYNC_TIMEOUT: ${ICLOUD_API_SYNC_TIMEOUT:-70s}
+      ICLOUD_API_SYNC_CONCURRENCY: ${ICLOUD_API_SYNC_CONCURRENCY:-3}
+      ICLOUD_API_SHUTDOWN_TIMEOUT: ${ICLOUD_API_SHUTDOWN_TIMEOUT:-110s}
+      ICLOUD_API_MAX_MESSAGE_BYTES: ${ICLOUD_API_MAX_MESSAGE_BYTES:-104857600}
+      ICLOUD_API_MAX_BODY_BYTES: ${ICLOUD_API_MAX_BODY_BYTES:-524288}
+      ICLOUD_API_OTP_RETURN_LAST_ONLY: ${ICLOUD_API_OTP_RETURN_LAST_ONLY:-false}
+      ICLOUD_API_OTP_RETURN_LATEST_ONLY: ${ICLOUD_API_OTP_RETURN_LATEST_ONLY:-}
+      ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS: ${ICLOUD_API_ALLOW_WEAK_RECIPIENT_HEADERS:-false}
+      # The port is published on host loopback only. Trust the Docker bridge so
+      # the 1Panel proxy's X-Forwarded-For value can restore the client IP.
+      # Override this with the exact bridge gateway or CIDR when known.
+      ICLOUD_API_TRUSTED_PROXIES: ${ICLOUD_API_TRUSTED_PROXIES:-10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - postgres_socket:/var/run/postgresql:ro
+      - postgres_config:/run/icloud-api-database:ro
+      - installation_state:/run/icloud-api-installation
+      - icloud_api_data:/app/legacy:ro
+      - icloud_api_keys:/app/keys
+      - icloud_api_mail_archive:/app/mail-archive
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: ${ICLOUD_API_POSTGRES_IMAGE:-ghcr.io/t508708/icloud-mail-postgres:latest}
+    pull_policy: always
+    restart: unless-stopped
+    stop_grace_period: 60s
+    deploy:
+      replicas: 1
+    network_mode: "none"
+    environment:
+      ICLOUD_API_DATABASE_CONFIG_DIR: /run/icloud-api-database
+      ICLOUD_API_INSTALLATION_STATE_DIR: /run/icloud-api-installation
+      POSTGRES_HOST_AUTH_METHOD: reject
+      POSTGRES_INITDB_ARGS: --auth-local=scram-sha-256 --auth-host=reject
+      TZ: ${TZ:-Asia/Shanghai}
+    command:
+      - postgres
+      - -c
+      - listen_addresses=
+      - -c
+      - unix_socket_directories=/var/run/postgresql
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - postgres_socket:/var/run/postgresql
+      - postgres_config:/run/icloud-api-database
+      - installation_state:/run/icloud-api-installation
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/icloud-api-postgres-entrypoint", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  postgres_socket:
+  postgres_config:
+  installation_state:
+  icloud_api_data:
+  icloud_api_keys:
+  icloud_api_mail_archive:

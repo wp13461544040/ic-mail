@@ -1,0 +1,198 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+import { normalizeAccount } from "../src/api/admin.js";
+import {
+  isForwardedICloudIMAP,
+  mailboxReceiveRule,
+} from "../src/utils/imap.js";
+
+const viewPath = new URL(
+  "../src/views/AccountFormView.vue",
+  import.meta.url,
+);
+const stylesPath = new URL("../src/styles/index.css", import.meta.url);
+
+test("account form exposes editable IMAP host and port with iCloud defaults", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  const emailField = source.match(
+    /<el-form-item[^>]*label="iCloud 主号邮箱"[^>]*prop="email">([\s\S]*?)<\/el-form-item>/,
+  )?.[1];
+  const imapUsernameField = source.match(
+    /<el-form-item label="IMAP 用户名" prop="imapUsername">([\s\S]*?)<\/el-form-item>/,
+  )?.[1];
+  assert.ok(emailField, "email form item should be present");
+  assert.ok(imapUsernameField, "IMAP username form item should be present");
+  assert.match(emailField, /v-model="form\.email"/);
+  assert.match(emailField, /:readonly="emailLocked"/);
+  assert.match(emailField, /已有隐私邮箱后，主号邮箱不能修改。/);
+  assert.match(imapUsernameField, /v-model="form\.imapUsername"/);
+  assert.doesNotMatch(imapUsernameField, /:readonly=/);
+  assert.doesNotMatch(imapUsernameField, /已有隐私邮箱后，主号邮箱不能修改。/);
+  assert.doesNotMatch(source, /主号邮箱和 IMAP 用户名不能修改/);
+  assert.match(source, /v-model="form\.imapHost"/);
+  assert.match(source, /v-model="form\.imapPort"/);
+  assert.match(source, /DEFAULT_IMAP_HOST/);
+  assert.match(source, /DEFAULT_IMAP_PORT/);
+  assert.match(source, /imapHost: DEFAULT_IMAP_HOST/);
+  assert.match(source, /imapPort: DEFAULT_IMAP_PORT/);
+  assert.match(source, /normalizeIMAPEndpoint/);
+  assert.match(source, /imapHost: imapEndpoint\.host/);
+  assert.match(source, /imapPort: imapEndpoint\.port/);
+  assert.match(source, /imap_host: imapEndpoint\.host/);
+  assert.match(source, /imap_port: imapEndpoint\.port/);
+  assert.match(source, /imapPort: \[\{ validator: validateIMAPPort/);
+  assert.doesNotMatch(source, /model-value="imap\.mail\.me\.com:993（TLS）"\s+readonly/);
+});
+
+test("disabling a primary account requires confirmation and preserves its aliases and history", async () => {
+  const source = await readFile(viewPath, "utf8");
+  assert.match(source, /隐藏邮箱列表不显示下属邮箱，邮箱池入池候选也隐藏/);
+  assert.match(source, /storedEnabled\.value && !form\.enabled/);
+  assert.match(source, /ElMessageBox\.confirm\([\s\S]*?确认停用主号/);
+  assert.match(source, /恢复邮箱列表显示，并按停用前快照恢复原启用及池成员状态/);
+  assert.match(source, /原本单独停用的邮箱仍保持停用/);
+  assert.match(source, /不会删除邮箱、邮件或领取历史/);
+  assert.match(source, /confirmationCancelled\(error\)/);
+  assert.match(source, /if \(!viewActive \|\| submittedRouteKey !== routeKey\(\)\) return;[\s\S]*?const imapEndpoint/);
+  assert.match(source, /submittedAccountId = String\(route\.params\.id \|\| ""\)/);
+  assert.match(source, /主号已停用；收件已暂停，下属邮箱已从隐藏邮箱列表和入池候选中隐藏/);
+});
+
+test("account normalizer keeps custom IMAP endpoint and defaults missing values", () => {
+  const custom = normalizeAccount({
+    imap_host: "mail.example.test",
+    imap_port: 1143,
+  });
+  assert.deepEqual(
+    {
+      host: custom.imapHost,
+      port: custom.imapPort,
+    },
+    { host: "mail.example.test", port: 1143 },
+  );
+  assert.deepEqual(
+    {
+      host: normalizeAccount({}).imapHost,
+      port: normalizeAccount({}).imapPort,
+    },
+    { host: "imap.mail.me.com", port: 993 },
+  );
+  const normalizedTypes = normalizeAccount({
+    imap_host: " IMAP.Example.Test. ",
+    imap_port: "1993",
+  });
+  assert.equal(normalizedTypes.imapHost, "imap.example.test");
+  assert.equal(normalizedTypes.imapPort, 1993);
+  assert.equal(typeof normalizedTypes.imapHost, "string");
+  assert.equal(typeof normalizedTypes.imapPort, "number");
+
+  const normalizedIPv6 = normalizeAccount({
+    IMAPHost: "2001:DB8:0:0::1",
+    IMAPPort: 65535,
+  });
+  assert.equal(normalizedIPv6.imapHost, "2001:db8::1");
+  assert.equal(normalizedIPv6.imapPort, 65535);
+});
+
+test("IMAP validation errors stay in flow before the endpoint hint", async () => {
+  const styles = await readFile(stylesPath, "utf8");
+
+  assert.match(
+    styles,
+    /\.imap-service-fields \.el-form-item__error\s*\{[^}]*position:\s*static;/s,
+  );
+  assert.match(
+    styles,
+    /\.imap-service-fields \.el-form-item__error\s*\{[^}]*flex:\s*0 0 100%;/s,
+  );
+  assert.match(
+    styles,
+    /\.imap-service-fields \.el-form-item\s*\{[^}]*margin-bottom:\s*0;/s,
+  );
+});
+
+test("account form keeps local responsive layout constraints", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /<section class="content-narrow page-stack account-form-page">/);
+  assert.match(source, /<style scoped>/);
+  assert.match(source, /\.account-form-page\s*\{[^}]*max-width:\s*960px;[^}]*margin-inline:\s*auto;/s);
+  assert.match(source, /\.account-form-page :deep\(\.form-grid\)\s*\{[^}]*align-items:\s*start;[^}]*row-gap:\s*20px;/s);
+  assert.match(source, /\.account-form-page :deep\(\.form-grid > \.el-form-item\)\s*\{[^}]*min-width:\s*0;[^}]*margin-bottom:\s*0;/s);
+  assert.match(source, /\.account-form-page \.form-actions\s*\{[^}]*margin-top:\s*20px;/s);
+  assert.match(source, /\.account-form-page :deep\(\.imap-service-fields\)\s*\{[^}]*minmax\(0, 1fr\) 112px;/s);
+  assert.match(source, /@media \(max-width: 720px\)\s*\{[^}]*minmax\(0, 1fr\) 88px;/s);
+  assert.match(source, /\.account-form-page :deep\(\.imap-service-fields \.el-form-item__error\)[\s\S]*?position:\s*static;/s);
+  assert.match(source, /\.account-form-page :deep\(\.mailbox-route-summary\)[\s\S]*?padding:\s*12px 14px;/s);
+});
+
+test("account form exposes custom mailbox suffix and keeps the iCloud branch", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /label="邮箱类型"/);
+  assert.match(source, /label="邮箱后缀"/);
+  assert.doesNotMatch(source, /<el-form-item v-else label="自定义邮箱"/);
+  assert.match(source, /v-model="form\.emailSuffix"/);
+  assert.match(source, /:label="usesGenericIMAPPassword \? 'IMAP 密码' : 'App 专用密码'"/);
+  assert.match(source, /mailbox_type: form\.mailboxType/);
+  assert.match(source, /payload\.email_suffix\s*=/);
+  assert.match(source, /imap_password:\s*usesGenericIMAPPassword\.value/);
+  assert.match(source, /邮箱后缀格式不正确/);
+});
+
+test("third-party and custom IMAP passwords preserve whitespace while direct iCloud trims", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /const password = String\(value \?\? ""\)/);
+  assert.match(
+    source,
+    /const passwordMissing = usesGenericIMAPPassword\.value\s*\? password\.length === 0\s*:\s*!password\.trim\(\)/,
+  );
+  assert.match(
+    source,
+    /imap_password: usesGenericIMAPPassword\.value\s*\? form\.imapPassword\s*:\s*form\.imapPassword\.trim\(\)/,
+  );
+  assert.match(source, /receiveRule\.value === "icloud-forwarded"/);
+});
+
+test("account normalizer preserves custom mailbox metadata", () => {
+  const account = normalizeAccount({
+    provider: "custom",
+    email_suffix: "example.test",
+  });
+  assert.equal(account.mailboxType, "custom");
+  assert.equal(account.provider, "custom");
+  assert.equal(account.emailSuffix, "example.test");
+});
+
+test("mailbox receive rules distinguish direct iCloud, forwarded iCloud, and custom", () => {
+  const direct = {
+    mailboxType: "icloud",
+    email: "owner@icloud.com",
+    imapHost: "imap.mail.me.com",
+    imapPort: 993,
+    imapUsername: "owner@icloud.com",
+  };
+  const forwarded = {
+    ...direct,
+    imapHost: "imap.example.com",
+    imapUsername: "mango@example.com",
+  };
+  const custom = {
+    mailboxType: "custom",
+    emailSuffix: "example.com",
+    imapHost: "imap.example.com",
+    imapPort: 993,
+    imapUsername: "mango@example.com",
+  };
+
+  assert.equal(mailboxReceiveRule(direct), "icloud-direct");
+  assert.equal(mailboxReceiveRule(forwarded), "icloud-forwarded");
+  assert.equal(mailboxReceiveRule(custom), "custom");
+  assert.equal(isForwardedICloudIMAP(direct), false);
+  assert.equal(isForwardedICloudIMAP(forwarded), true);
+  assert.equal(isForwardedICloudIMAP(custom), false);
+});

@@ -1,0 +1,198 @@
+import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
+import test from "node:test";
+
+const viewPath = new URL("../src/views/LogsView.vue", import.meta.url);
+const detailPath = new URL(
+  "../src/components/RuntimeLogDetailDialog.vue",
+  import.meta.url,
+);
+const routerPath = new URL("../src/router/index.js", import.meta.url);
+const layoutPath = new URL("../src/layouts/AdminLayout.vue", import.meta.url);
+
+function functionBody(source, signature) {
+  const start = source.indexOf(signature);
+  assert.notEqual(start, -1, `missing ${signature}`);
+  const opening = source.indexOf("{", start);
+  assert.notEqual(opening, -1, `missing body for ${signature}`);
+  let depth = 0;
+  for (let index = opening; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(opening, index + 1);
+    }
+  }
+  assert.fail(`unterminated body for ${signature}`);
+}
+
+test("all logs view is routed and exposed in admin navigation", async () => {
+  const [router, layout] = await Promise.all([
+    readFile(routerPath, "utf8"),
+    readFile(layoutPath, "utf8"),
+  ]);
+
+  assert.match(router, /path:\s*"logs"[\s\S]{0,100}name:\s*"logs"/);
+  assert.match(router, /import\("\.\.\/views\/LogsView\.vue"\)/);
+  assert.match(layout, /to:\s*\{\s*name:\s*"logs"\s*\}[\s\S]{0,100}label:\s*"全部日志"/);
+});
+
+test("all logs view supports filters, selectable pages, batched all-items loading, live refresh, and responsive records", async () => {
+  const source = await readFile(viewPath, "utf8");
+
+  assert.match(source, /v-model="filters\.level"/);
+  assert.match(source, /v-model="filters\.accountId"/);
+  assert.match(source, /v-model="keywordDraft"/);
+  assert.match(source, /route\.query\.account_id/);
+  assert.match(source, /route\.query\.level/);
+  assert.match(source, /route\.query\.query/);
+  assert.match(source, /getRuntimeLogs\(requestOptions\)/);
+  assert.match(source, /offset:\s*\(page - 1\) \* pageSize\.value/);
+  assert.match(source, /getAllRuntimeLogs\(requestOptions\)/);
+  assert.match(source, /<ListPagination/);
+  assert.match(source, /:page="currentPage"/);
+  assert.match(source, /:total="total"/);
+  assert.match(source, /pageSize\s*=\s*ref\(DEFAULT_PAGE_SIZE\)/);
+  assert.match(source, /getAccountPage\(\{/);
+  assert.match(source, /:remote-method="searchAccounts"/);
+  assert.doesNotMatch(source, /加载更多|MAX_VISIBLE_LOGS|appendRuntimeLogPage/);
+  assert.match(source, /createLiveRefresh\(\(\) => loadLatestLogs\(\{ silent: true \}\),\s*\{ intervalMs: 5_000 \}\)/);
+  assert.match(source, /v-model="autoRefreshEnabled"/);
+  assert.match(source, /@size-change="handlePageSizeChange"/);
+  assert.match(source, /class="data-panel desktop-data-table virtual-list-table"/);
+  assert.match(source, /class="mobile-record-list"/);
+  assert.match(source, /<RuntimeLogDetailDialog/);
+  assert.match(source, /getRuntimeLogRun\(syncRunId,\s*\{/);
+  assert.match(source, /getAutoCreateLogRun\(autoCreateRunId,\s*\{/);
+  assert.match(source, /const autoCreateRunId = String\(log\?\.autoCreateRunId/);
+  assert.match(source, /if \(autoCreateRunId\) return `auto-create:\$\{autoCreateRunId\}`/);
+  assert.match(source, /detailFlowAbortController\?\.abort\(\)/);
+  assert.match(source, /:flow-loading="detailFlowLoading"/);
+  assert.match(source, /:flow-error="detailFlowError"/);
+  assert.match(source, /@retry-flow="loadSelectedLogFlow"/);
+  assert.match(source, /@media \(max-width: 720px\)/);
+});
+
+test("all logs view displays custom accounts by suffix and keeps iCloud email labels", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const identityBody = functionBody(source, "function formatAccountIdentity");
+  const formatAccountIdentity = Function(
+    `"use strict"; return function (account) ${identityBody}`,
+  )();
+
+  assert.equal(
+    formatAccountIdentity({
+      email: "custom@example.test",
+      mailboxType: "custom",
+      emailSuffix: "example.test",
+    }),
+    "@example.test",
+  );
+  assert.equal(
+    formatAccountIdentity({
+      email: "primary@icloud.com",
+      mailboxType: "icloud",
+      emailSuffix: "",
+    }),
+    "primary@icloud.com",
+  );
+  assert.equal(
+    formatAccountIdentity({
+      email: "custom@unknown.test",
+      mailboxType: "icloud",
+      emailSuffix: "unknown.test",
+    }),
+    "custom@unknown.test",
+  );
+  assert.match(source, /:label="formatAccountIdentity\(account\)"/);
+  assert.match(
+    functionBody(source, "function accountLabel"),
+    /return formatAccountIdentity\(account\) \|\| `主号 #\$\{accountId\}`/,
+  );
+});
+
+test("historical pages stop live refresh and the switch controls the scheduler", async () => {
+  const source = await readFile(viewPath, "utf8");
+  const pageHandlerStart = source.indexOf("function handlePageChange");
+  const pageHandlerEnd = source.indexOf("\n}", pageHandlerStart);
+  const pageHandler = source.slice(pageHandlerStart, pageHandlerEnd);
+  const watcherStart = source.indexOf("watch(autoRefreshEnabled");
+  const watcherEnd = source.indexOf("\n});", watcherStart);
+  const watcher = source.slice(watcherStart, watcherEnd);
+
+  assert.notEqual(pageHandlerStart, -1);
+  assert.notEqual(pageHandlerEnd, -1);
+  assert.match(pageHandler, /nextPage > 1 && autoRefreshEnabled\.value/);
+  assert.match(pageHandler, /autoRefreshEnabled\.value = false/);
+  assert.notEqual(watcherStart, -1);
+  assert.notEqual(watcherEnd, -1);
+  assert.match(watcher, /logRequestGate\.invalidate\(\)/);
+  assert.match(watcher, /loadLatestLogs\(\{ force: true \}\)/);
+  assert.match(watcher, /liveRefresh\.start\(\{ immediate: false \}\)/);
+});
+
+test("runtime log details show loadable, copyable sync and automatic creation timelines", async () => {
+  const source = await readFile(detailPath, "utf8");
+
+  assert.match(source, /<pre>\{\{ log\.message \|\| "-" \}\}<\/pre>/);
+  assert.match(source, /<pre>\{\{ attributesText \}\}<\/pre>/);
+  assert.doesNotMatch(source, /v-html|innerHTML/);
+  assert.match(source, /v-if="flowLoading"[\s\S]{0,300}<el-skeleton/);
+  assert.match(source, /v-if="flowError"[\s\S]{0,300}<RequestAlert/);
+  assert.match(source, /重新加载完整流程/);
+  assert.match(source, /v-if="hasFlow"[\s\S]{0,250}@click="emit\('retry-flow'\)"/);
+  assert.match(source, /"刷新自动创建流程"\s*:\s*"刷新同步流程"/);
+  assert.match(source, /v-for="entry in orderedFlowLogs"/);
+  assert.match(source, /失败于 \{\{ stageLabel\(entry\.failedStage\) \}\}/);
+  assert.match(source, /<strong>错误详情<\/strong>[\s\S]{0,100}entry\.errorDetail/);
+  assert.match(source, /entry\.errorCode/);
+  assert.match(source, /entry\.errorClass/);
+  assert.match(source, /entry\.causeCategory/);
+  assert.match(source, /原因分类/);
+  assert.match(source, /schedule:\s*"计划调度"/);
+  assert.match(source, /entry\.errorContext/);
+  assert.match(source, /entry\.httpStatus/);
+  assert.match(source, /entry\.retryable/);
+  assert.match(source, /entry\.elapsedMs/);
+  assert.match(source, /batchElapsedMs\(entry\)/);
+  assert.match(source, /batch_elapsed_ms/);
+  assert.match(source, /entry\.scheduleAction/);
+  assert.match(source, /可能已产生远端变更/);
+  assert.match(source, /resultStateRecorded\(entry\)/);
+  assert.match(source, /result_state_recorded/);
+  assert.match(source, /计划状态写回/);
+  assert.match(source, /function diagnosticLines\(entry\)/);
+  assert.match(source, /失败诊断/);
+  assert.match(source, /操作位置：[\s\S]{0,100}entry\.failedOperation/);
+  assert.match(source, /当前仅展示日志缓冲区内保留的部分流程/);
+  assert.match(source, /\["started", "run_started", "run_queued"\]/);
+  assert.match(source, /firstEvent === "run_deferred"/);
+  assert.match(source, /flowStage\(firstEntry\) === "deferred"/);
+  assert.match(source, /"run_deferred"/);
+  assert.match(source, /\["completed", "deferred", "failed", "cancelled"\]/);
+  assert.match(source, /runtime-log-flow__item--deferred/);
+  assert.match(source, /function isDeferredFlowEntry\(entry\)/);
+  assert.match(source, /v-else-if="flowIsRunning"/);
+  assert.match(source, /该次同步尚未结束/);
+  assert.match(source, /该次自动创建尚未结束/);
+  assert.match(source, /Boolean\(props\.log\?\.autoCreateRunId\)/);
+  assert.match(source, /自动创建流程详情/);
+  assert.match(source, /创建编号/);
+  assert.match(source, /自动创建流程/);
+  assert.match(source, /runtimeLogAutoCreateStageLabel\(stage\)/);
+  assert.match(source, /entry\?\.autoCreateStage/);
+  assert.match(source, /entry\?\.autoCreatePercent/);
+  assert.match(source, /entry\?\.autoCreateEvent/);
+  assert.match(source, /await copyText\(fullLogText\.value\)/);
+  assert.match(source, /完整日志已复制/);
+  assert.match(source, /完整同步流程已复制/);
+  assert.match(source, /完整自动创建流程已复制/);
+  assert.match(source, /复制完整自动创建流程/);
+  assert.match(source, /function flowLogText\(\)/);
+  assert.match(source, /role="status"[\s\S]{0,100}aria-live="polite"/);
+  assert.doesNotMatch(source, /runtime-log-detail__announcement/);
+  assert.match(source, /width="min\(900px, calc\(100vw - 28px\)\)"/);
+  assert.match(source, /overflow-wrap:\s*anywhere/);
+  assert.match(source, /max-height:\s*52dvh/);
+  assert.match(source, /@media \(max-width: 600px\)/);
+});

@@ -1,0 +1,108 @@
+import { computed, reactive } from "vue";
+
+import {
+  getLoginCsrf,
+  getSession,
+  login as loginRequest,
+  logout as logoutRequest,
+} from "../api/admin.js";
+import { consumeSessionBootstrap } from "../utils/sessionBootstrap.js";
+
+const state = reactive({
+  username: "",
+  csrfToken: "",
+  sessionChecked: false,
+  lastSessionErrorCode: "",
+});
+
+let sessionPromise = null;
+let bootstrapAvailable = true;
+
+function discardBootstrap() {
+  bootstrapAvailable = false;
+  consumeSessionBootstrap();
+}
+
+function applySession(session) {
+  state.username = session?.username || "";
+  state.csrfToken = session?.csrfToken || "";
+  state.sessionChecked = true;
+  state.lastSessionErrorCode = "";
+}
+
+function clearSession({ checked = true, errorCode = "" } = {}) {
+  discardBootstrap();
+  state.username = "";
+  state.csrfToken = "";
+  state.sessionChecked = checked;
+  state.lastSessionErrorCode = errorCode;
+}
+
+async function ensureSession({ force = false } = {}) {
+  if (!force && state.sessionChecked) {
+    return Boolean(state.username && state.csrfToken);
+  }
+  if (sessionPromise) {
+    return sessionPromise;
+  }
+
+  if (force) discardBootstrap();
+  if (bootstrapAvailable) {
+    bootstrapAvailable = false;
+    const session = consumeSessionBootstrap();
+    if (session) {
+      applySession(session);
+      return true;
+    }
+  }
+
+  sessionPromise = getSession()
+    .then((session) => {
+      applySession(session);
+      return Boolean(state.username && state.csrfToken);
+    })
+    .catch((error) => {
+      clearSession({ errorCode: error?.code || "" });
+      if (error?.status === 401) {
+        return false;
+      }
+      throw error;
+    })
+    .finally(() => {
+      sessionPromise = null;
+    });
+  return sessionPromise;
+}
+
+async function prepareLogin() {
+  state.csrfToken = await getLoginCsrf();
+  return state.csrfToken;
+}
+
+async function login(username, password) {
+  discardBootstrap();
+  if (!state.csrfToken) {
+    await prepareLogin();
+  }
+  const session = await loginRequest(username, password, state.csrfToken);
+  applySession(session);
+  return session;
+}
+
+async function logout() {
+  discardBootstrap();
+  await logoutRequest(state.csrfToken);
+  clearSession({ checked: false });
+}
+
+export function useAuth() {
+  return {
+    state,
+    isAuthenticated: computed(() => Boolean(state.username && state.csrfToken)),
+    ensureSession,
+    prepareLogin,
+    login,
+    logout,
+    clearSession,
+  };
+}
