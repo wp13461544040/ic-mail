@@ -8,7 +8,7 @@ RUN sed -i "s#dl-cdn.alpinelinux.org#${ALPINE_MIRROR}#g" /etc/apk/repositories \
 
 COPY docker/postgres-entrypoint.sh /usr/local/bin/icloud-api-postgres-entrypoint
 COPY docker/postgres-persist-credentials.sh /docker-entrypoint-initdb.d/001-icloud-api-persist-credentials.sh
-COPY LICENSE NOTICE.md /usr/share/licenses/icloud-mail/
+COPY LICENSE /usr/share/licenses/icloud-mail/
 RUN sed -i 's/\r$//' \
         /usr/local/bin/icloud-api-postgres-entrypoint \
         /docker-entrypoint-initdb.d/001-icloud-api-persist-credentials.sh \
@@ -69,7 +69,7 @@ COPY --from=go-builder --chown=app:app /out/icloud-api /app/icloud-api
 COPY --from=web-builder --chown=app:app /src/web/dist/ /app/web/
 COPY --from=go-builder /out/licenses/go/ /usr/share/licenses/icloud-mail/go/
 COPY --from=web-builder /out/licenses/npm/ /usr/share/licenses/icloud-mail/npm/
-COPY LICENSE NOTICE.md /usr/share/licenses/icloud-mail/
+COPY LICENSE /usr/share/licenses/icloud-mail/
 COPY --chown=app:app docker/icloud-api-entrypoint.sh /usr/local/bin/icloud-api-entrypoint
 COPY --chown=app:app docker/keys-maintenance.sh /usr/local/bin/icloud-api-keys-maintenance
 RUN sed -i 's/\r$//' \
