@@ -52,7 +52,6 @@
 
 <script setup>
 import {
-  ChatDotRound,
   Connection,
   Document,
   Lock,
@@ -79,7 +78,6 @@ const auth = useAuth();
 const page = usePageHeader();
 const drawerOpen = ref(false);
 const logoutLoading = ref(false);
-const qqGroupURL = "https://qm.qq.com/q/6KWBNKKDEk";
 
 const menuItems = [
   { to: { name: "accounts" }, label: "主号管理", icon: Connection, section: "accounts" },
@@ -137,17 +135,6 @@ const SidebarFooter = defineComponent({
     };
     return () =>
       h("div", { class: "admin-sidebar__footer" }, [
-        h(
-          "a",
-          {
-            class: "admin-sidebar__qq",
-            href: qqGroupURL,
-            target: "_blank",
-            rel: "noopener noreferrer",
-            title: "加入 QQ 群 1105888476",
-          },
-          [h(ChatDotRound, { "aria-hidden": "true" }), h("span", "QQ 群 1105888476")],
-        ),
         h("div", { class: "admin-sidebar__footer-main" }, [
           h("span", { class: "admin-sidebar__username", title: auth.state.username }, auth.state.username),
           h(
